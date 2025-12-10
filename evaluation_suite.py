@@ -1,6 +1,6 @@
 """
 Comprehensive Evaluation Suite for Twin Attention Cell Identification Model
-Calculates all metrics from the paper's Results section (3.1-3.6)
+Fixed version - uses exact same metric computation as training code
 """
 
 import os
@@ -21,9 +21,7 @@ from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
-import seaborn as sns
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial import KDTree
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -47,58 +45,46 @@ print(f"Using device: {device}")
 # CONFIGURATION
 # =============================================================================
 class EvalConfig:
-    """Configuration for evaluation paths and parameters"""
-    # Default paths - Windows paths converted for cross-platform
     TRAIN_DATA_PATH = r"C:\Users\henry\OneDrive\Documents\Research Folder\Data\data_dict.pkl"
     EVAL_DATA_PATH = r"C:\Users\henry\OneDrive\Documents\Research Folder\Data\evaluation_data_dict.pkl"
     MODEL_PATH = r"C:\Users\henry\OneDrive\Documents\Research Folder\Data\twin_attention_final.pth"
-    REAL_EMBRYO_PATH = None  # Set when available
+    REAL_EMBRYO_PATH = None
 
-    # Output directory
     OUTPUT_DIR = "evaluation_results"
     FIGURE_DIR = "evaluation_figures"
 
-    # Model config
     EMBED_DIM = 128
     NUM_HEADS = 8
     NUM_LAYERS = 6
     DROPOUT = 0.1
 
-    # Evaluation params
     BATCH_SIZE = 16
     MIN_CELLS = 5
     MAX_CELLS = 20
     STAGE_LIMIT = 194
     K_NEIGHBORS = 30
 
-    # Bootstrap params
     N_BOOTSTRAP = 1000
-    CONFIDENCE_LEVEL = 0.95
 
 
 def convert_path(path):
-    """Convert Windows path to current OS path"""
     if path is None:
         return None
-    # Handle Windows paths on Linux
     if os.name != 'nt' and '\\' in path:
-        # Extract just the filename for now
         return os.path.basename(path.replace('\\', '/'))
     return path
 
 
 # =============================================================================
-# DATA LOADING
+# DATA & MODEL LOADING
 # =============================================================================
-def load_data(config: EvalConfig):
-    """Load training and evaluation data"""
+def load_data(config):
     print("\n" + "="*60)
     print("LOADING DATA")
     print("="*60)
 
     data = {}
 
-    # Try to load training data
     train_path = convert_path(config.TRAIN_DATA_PATH)
     if os.path.exists(train_path):
         print(f"Loading training data from: {train_path}")
@@ -106,10 +92,8 @@ def load_data(config: EvalConfig):
             data['train'] = pickle.load(f)
         print(f"  Loaded {len(data['train'])} embryos")
     else:
-        print(f"  Training data not found at: {train_path}")
         data['train'] = None
 
-    # Try to load evaluation data
     eval_path = convert_path(config.EVAL_DATA_PATH)
     if os.path.exists(eval_path):
         print(f"Loading evaluation data from: {eval_path}")
@@ -117,28 +101,20 @@ def load_data(config: EvalConfig):
             data['eval'] = pickle.load(f)
         print(f"  Loaded {len(data['eval'])} embryos")
     else:
-        print(f"  Evaluation data not found at: {eval_path}")
         data['eval'] = None
 
-    # Try to load real embryo data
-    if config.REAL_EMBRYO_PATH:
-        real_path = convert_path(config.REAL_EMBRYO_PATH)
-        if os.path.exists(real_path):
-            print(f"Loading real embryo data from: {real_path}")
-            with open(real_path, 'rb') as f:
-                data['real'] = pickle.load(f)
-            print(f"  Loaded {len(data['real'])} real embryos")
-        else:
-            print(f"  Real embryo data not found at: {real_path}")
-            data['real'] = None
-    else:
-        data['real'] = None
+    # Show sample cell IDs
+    sample_data = data.get('train') or data.get('eval')
+    if sample_data:
+        print("\n  Sample cell IDs from data:")
+        for embryo, timepoints in list(sample_data.items())[:1]:
+            for t, cells in list(timepoints.items())[:1]:
+                print(f"    {list(cells.keys())[:8]}")
 
     return data
 
 
-def load_model(config: EvalConfig):
-    """Load trained model"""
+def load_model(config):
     print("\n" + "="*60)
     print("LOADING MODEL")
     print("="*60)
@@ -163,14 +139,11 @@ def load_model(config: EvalConfig):
             model.load_state_dict(checkpoint)
         print("  Model loaded successfully")
     else:
-        print(f"  Model not found at: {model_path}")
-        print("  Using randomly initialized model (results will not be meaningful)")
+        print(f"  WARNING: Model not found at {model_path}")
 
     model = model.to(device)
     model.eval()
-
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model parameters: {n_params:,}")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     return model
 
@@ -178,71 +151,66 @@ def load_model(config: EvalConfig):
 # =============================================================================
 # LINEAGE UTILITIES
 # =============================================================================
-C_ELEGANS_FOUNDERS = ['AB', 'MS', 'E', 'C', 'D', 'P4', 'P1', 'P2', 'P3', 'EMS', 'P0']
+def parse_cell_id(cell_id):
+    """Parse cell ID - handles C. elegans nomenclature"""
+    cell_id = str(cell_id).strip()
+    founders = ['AB', 'MS', 'E', 'C', 'D', 'P4', 'P3', 'P2', 'P1', 'P0', 'EMS', 'Z2', 'Z3']
+    upper_id = cell_id.upper()
 
-def get_founder_lineage(cell_id: str) -> str:
-    """Extract founder lineage from cell ID"""
-    cell_id = str(cell_id).upper()
-    for founder in ['AB', 'MS', 'E', 'C', 'D', 'P4', 'P3', 'P2', 'P1', 'P0', 'EMS']:
-        if cell_id.startswith(founder):
-            return founder
-    return 'UNKNOWN'
+    for founder in founders:
+        if upper_id.startswith(founder):
+            return {'founder': founder, 'lineage': cell_id, 'depth': len(cell_id) - len(founder)}
 
-def get_sub_lineage(cell_id: str, depth: int = 2) -> str:
-    """Get sub-lineage at specified depth (e.g., ABal, ABar, ABpl, ABpr)"""
-    cell_id = str(cell_id).upper()
-    founder = get_founder_lineage(cell_id)
-    if founder == 'AB' and len(cell_id) > 2:
-        return cell_id[:min(len(cell_id), 2 + depth)]
-    return founder
+    return {'founder': 'UNKNOWN', 'lineage': cell_id, 'depth': 0}
 
-def get_parent(cell_id: str) -> str:
-    """Get parent cell ID"""
-    if len(cell_id) <= 1:
-        return None
-    return cell_id[:-1]
 
-def are_siblings(cell1: str, cell2: str) -> bool:
-    """Check if two cells are siblings"""
-    p1, p2 = get_parent(cell1), get_parent(cell2)
-    return p1 is not None and p1 == p2
+def get_founder(cell_id):
+    return parse_cell_id(cell_id)['founder']
 
-def is_parent_child(cell1: str, cell2: str) -> bool:
-    """Check if cells have parent-child relationship"""
-    return get_parent(cell1) == cell2 or get_parent(cell2) == cell1
 
-def same_lineage_branch(cell1: str, cell2: str) -> bool:
-    """Check if cells are in same lineage branch"""
-    return get_founder_lineage(cell1) == get_founder_lineage(cell2)
+def same_founder(c1, c2):
+    return get_founder(c1) == get_founder(c2)
+
+
+def are_siblings(c1, c2):
+    p1, p2 = parse_cell_id(c1), parse_cell_id(c2)
+    if p1['founder'] == 'UNKNOWN' or p2['founder'] == 'UNKNOWN':
+        return False
+    l1, l2 = p1['lineage'], p2['lineage']
+    return len(l1) >= 2 and len(l2) >= 2 and l1[:-1] == l2[:-1] and l1 != l2
+
+
+def same_sublineage(c1, c2, depth=2):
+    p1, p2 = parse_cell_id(c1), parse_cell_id(c2)
+    if p1['founder'] != p2['founder']:
+        return False
+    if p1['founder'] == 'UNKNOWN':
+        return c1 == c2
+    f = p1['founder']
+    prefix1 = p1['lineage'][:len(f) + min(depth, p1['depth'])]
+    prefix2 = p2['lineage'][:len(f) + min(depth, p2['depth'])]
+    return prefix1 == prefix2
 
 
 # =============================================================================
-# BOOTSTRAP UTILITIES
+# BOOTSTRAP CI
 # =============================================================================
-def bootstrap_ci(values, n_bootstrap=1000, confidence=0.95):
-    """Compute bootstrap confidence interval"""
+def bootstrap_ci(values, n=1000):
     if len(values) == 0:
-        return np.nan, np.nan, np.nan
-
+        return 0, 0, 0
     values = np.array(values)
-    boot_means = []
-    for _ in range(n_bootstrap):
-        sample = np.random.choice(values, size=len(values), replace=True)
-        boot_means.append(np.mean(sample))
-
-    alpha = (1 - confidence) / 2
-    lower = np.percentile(boot_means, alpha * 100)
-    upper = np.percentile(boot_means, (1 - alpha) * 100)
-    mean = np.mean(values)
-
-    return mean, lower, upper
+    means = [np.mean(np.random.choice(values, len(values), replace=True)) for _ in range(n)]
+    return np.mean(values), np.percentile(means, 2.5), np.percentile(means, 97.5)
 
 
 # =============================================================================
-# SECTION 3.1: CORE IDENTIFICATION PERFORMANCE
+# CORE EVALUATION - MATCHES TRAINING CODE EXACTLY
 # =============================================================================
-class CorePerformanceEvaluator:
-    """Evaluate core identification performance metrics"""
+class MatchingEvaluator:
+    """
+    Evaluates using EXACT same logic as TwinAttentionMatchingLoss in training.
+    This ensures metrics match what was reported during training.
+    """
 
     def __init__(self, model, config):
         self.model = model
@@ -250,10 +218,18 @@ class CorePerformanceEvaluator:
         self.loss_fn = TwinAttentionMatchingLoss(use_uncertainty=True)
 
     @torch.no_grad()
-    def evaluate_dataset(self, dataloader, desc="Evaluating"):
-        """Run evaluation on a dataset"""
+    def evaluate(self, dataloader, desc="Evaluating"):
+        """Evaluate using same logic as training validation"""
         self.model.eval()
 
+        total_loss = 0
+        match_correct = 0
+        match_total = 0
+        outlier_correct = 0
+        outlier_total = 0
+        batch_count = 0
+
+        # For detailed analysis
         all_results = []
 
         for batch in tqdm(dataloader, desc=desc):
@@ -264,1228 +240,853 @@ class CorePerformanceEvaluator:
             mask2 = mask2.to(device)
             match_indices = match_indices.to(device)
 
-            # Forward pass
+            # Forward pass - exactly as in training
             z1, z2, temperature = self.model(pc1, pc2, mask1, mask2, epoch=100)
 
+            # Compute loss and metrics using the SAME loss function as training
+            loss, metrics = self.loss_fn(z1, z2, match_indices, temperature, mask1, mask2)
+
+            total_loss += loss.item()
+            match_correct += metrics['match_correct']
+            match_total += metrics['match_total']
+            outlier_correct += metrics['outlier_correct']
+            outlier_total += metrics['outlier_total']
+            batch_count += 1
+
+            # Store detailed results for later analysis
             if self.model.use_uncertainty:
-                z1_mean, z1_logvar = z1
-                z2_mean, z2_logvar = z2
+                z1_mean, _ = z1
+                z2_mean, _ = z2
                 sims = torch.bmm(z1_mean, z2_mean.transpose(1, 2)) / temperature
             else:
                 sims = torch.bmm(z1, z2.transpose(1, 2)) / temperature
 
             pred_indices = sims.argmax(dim=-1)
+            B, N1, N2 = sims.shape  # N2 includes no-match token
 
-            # Process each sample in batch
-            B = pc1.shape[0]
             for b in range(B):
-                n_valid = int(mask1[b].sum().item())
                 info = info_list[b]
+                n_valid = int(mask1[b].sum().item())
 
                 for i in range(n_valid):
+                    target = match_indices[b, i].item()
                     pred = pred_indices[b, i].item()
-                    target = match_indices[b, i].item()
-                    n2 = int(mask2[b].sum().item()) + 1  # +1 for no-match token
+                    is_match = target < N2 - 1  # Same check as loss function
 
-                    is_match = target < n2 - 1
-                    is_correct = pred == target
-
-                    # Get cell IDs
-                    cell1_id = info['cells1_ids'][i] if i < len(info['cells1_ids']) else f"cell_{i}"
-                    cell2_id = None
-                    if is_match and target < len(info['cells2_ids']):
-                        cell2_id = info['cells2_ids'][target]
-                    pred_cell_id = None
-                    if pred < len(info['cells2_ids']):
-                        pred_cell_id = info['cells2_ids'][pred]
-
-                    result = {
-                        'embryo1': info['run1'],
-                        'embryo2': info['run2'],
-                        'time1': info['time1'],
-                        'time2': info['time2'],
-                        'cell1_id': cell1_id,
-                        'cell2_id': cell2_id,
-                        'pred_cell_id': pred_cell_id,
-                        'pred': pred,
-                        'target': target,
+                    all_results.append({
                         'is_match': is_match,
-                        'is_correct': is_correct,
-                        'n_cells1': n_valid,
-                        'n_cells2': n2 - 1,
+                        'target': target,
+                        'pred': pred,
+                        'correct': pred == target,
+                        'n_cells': n_valid,
+                        'cell_id': info['cells1_ids'][i] if i < len(info['cells1_ids']) else None,
                         'confidence': torch.softmax(sims[b, i], dim=0).max().item()
-                    }
-                    all_results.append(result)
-
-        return all_results
-
-    def compute_metrics(self, results: List[dict]) -> dict:
-        """Compute all metrics from results"""
-        if not results:
-            return {}
-
-        # Overall metrics
-        match_results = [r for r in results if r['is_match']]
-        nomatch_results = [r for r in results if not r['is_match']]
-
-        match_correct = sum(1 for r in match_results if r['is_correct'])
-        nomatch_correct = sum(1 for r in nomatch_results if r['is_correct'])
-        total_correct = match_correct + nomatch_correct
-
-        metrics = {
-            'total_predictions': len(results),
-            'match_total': len(match_results),
-            'match_correct': match_correct,
-            'match_accuracy': match_correct / len(match_results) if match_results else 0,
-            'nomatch_total': len(nomatch_results),
-            'nomatch_correct': nomatch_correct,
-            'nomatch_accuracy': nomatch_correct / len(nomatch_results) if nomatch_results else 0,
-            'overall_correct': total_correct,
-            'overall_accuracy': total_correct / len(results) if results else 0,
-        }
-
-        # Bootstrap CIs
-        correct_flags = [1 if r['is_correct'] else 0 for r in results]
-        mean, lower, upper = bootstrap_ci(correct_flags, self.config.N_BOOTSTRAP)
-        metrics['overall_accuracy_ci'] = (lower, upper)
-
-        # By neighborhood size
-        size_bins = {'sparse_5_10': [], 'medium_11_15': [], 'dense_16_20': []}
-        for r in results:
-            n = r['n_cells1']
-            if 5 <= n <= 10:
-                size_bins['sparse_5_10'].append(1 if r['is_correct'] else 0)
-            elif 11 <= n <= 15:
-                size_bins['medium_11_15'].append(1 if r['is_correct'] else 0)
-            elif 16 <= n <= 20:
-                size_bins['dense_16_20'].append(1 if r['is_correct'] else 0)
-
-        for key, vals in size_bins.items():
-            if vals:
-                mean, lower, upper = bootstrap_ci(vals, self.config.N_BOOTSTRAP)
-                metrics[f'{key}_accuracy'] = mean
-                metrics[f'{key}_ci'] = (lower, upper)
-                metrics[f'{key}_count'] = len(vals)
-
-        # By developmental stage (cell count bins)
-        stage_bins = {
-            '4_20': (4, 20),
-            '21_50': (21, 50),
-            '51_100': (51, 100),
-            '101_150': (101, 150),
-            '151_194': (151, 194)
-        }
-
-        for stage_name, (low, high) in stage_bins.items():
-            stage_results = [r for r in results if low <= r['n_cells1'] <= high]
-            if stage_results:
-                correct = [1 if r['is_correct'] else 0 for r in stage_results]
-                mean, lower, upper = bootstrap_ci(correct, self.config.N_BOOTSTRAP)
-                metrics[f'stage_{stage_name}_accuracy'] = mean
-                metrics[f'stage_{stage_name}_ci'] = (lower, upper)
-                metrics[f'stage_{stage_name}_count'] = len(stage_results)
-
-        # Hierarchical accuracy
-        hierarchical = self._compute_hierarchical_accuracy(results)
-        metrics.update(hierarchical)
-
-        return metrics
-
-    def _compute_hierarchical_accuracy(self, results: List[dict]) -> dict:
-        """Compute hierarchical identification accuracy"""
-        exact_correct = 0
-        sublineage_correct = 0
-        founder_correct = 0
-        binary_correct = 0  # AB vs non-AB
-        total = 0
-
-        for r in results:
-            if not r['is_match']:
-                continue
-
-            total += 1
-            cell1 = str(r['cell1_id'])
-            pred_cell = str(r['pred_cell_id']) if r['pred_cell_id'] else ""
-            target_cell = str(r['cell2_id']) if r['cell2_id'] else ""
-
-            # Exact match
-            if r['is_correct']:
-                exact_correct += 1
-
-            # Sub-lineage match
-            if get_sub_lineage(cell1) == get_sub_lineage(pred_cell):
-                sublineage_correct += 1
-
-            # Founder lineage match
-            if get_founder_lineage(cell1) == get_founder_lineage(pred_cell):
-                founder_correct += 1
-
-            # Binary (AB vs non-AB)
-            cell1_is_ab = get_founder_lineage(cell1) == 'AB'
-            pred_is_ab = get_founder_lineage(pred_cell) == 'AB'
-            if cell1_is_ab == pred_is_ab:
-                binary_correct += 1
-
-        return {
-            'hierarchical_exact': exact_correct / total if total > 0 else 0,
-            'hierarchical_sublineage': sublineage_correct / total if total > 0 else 0,
-            'hierarchical_founder': founder_correct / total if total > 0 else 0,
-            'hierarchical_binary': binary_correct / total if total > 0 else 0,
-            'hierarchical_total': total
-        }
-
-
-# =============================================================================
-# SECTION 3.2: BASELINE METHODS
-# =============================================================================
-class BaselineEvaluator:
-    """Evaluate baseline methods for comparison"""
-
-    def __init__(self, config):
-        self.config = config
-
-    def evaluate_icp(self, pc1: np.ndarray, pc2: np.ndarray,
-                     cells1_ids: List[str], cells2_ids: List[str],
-                     max_iterations: int = 50) -> List[int]:
-        """Iterative Closest Point matching"""
-        # Simple ICP implementation
-        source = pc1.copy()
-        target = pc2.copy()
-
-        # Center both point clouds
-        source_centered = source - source.mean(axis=0)
-        target_centered = target - target.mean(axis=0)
-
-        # Iterative alignment
-        for _ in range(max_iterations):
-            # Find closest points
-            nbrs = NearestNeighbors(n_neighbors=1).fit(target_centered)
-            distances, indices = nbrs.kneighbors(source_centered)
-
-            # Compute optimal rotation using SVD
-            matched_target = target_centered[indices.flatten()]
-            H = source_centered.T @ matched_target
-            U, _, Vt = np.linalg.svd(H)
-            R_opt = Vt.T @ U.T
-
-            # Apply rotation
-            source_centered = source_centered @ R_opt.T
-
-        # Final matching
-        nbrs = NearestNeighbors(n_neighbors=1).fit(target_centered)
-        _, indices = nbrs.kneighbors(source_centered)
-
-        return indices.flatten().tolist()
-
-    def evaluate_cpd(self, pc1: np.ndarray, pc2: np.ndarray,
-                     cells1_ids: List[str], cells2_ids: List[str]) -> List[int]:
-        """Coherent Point Drift matching (simplified)"""
-        try:
-            from pycpd import RigidRegistration
-            reg = RigidRegistration(X=pc2, Y=pc1)
-            transformed, _ = reg.register()
-
-            nbrs = NearestNeighbors(n_neighbors=1).fit(pc2)
-            _, indices = nbrs.kneighbors(transformed)
-            return indices.flatten().tolist()
-        except ImportError:
-            # Fallback to simple nearest neighbor after centering
-            pc1_c = pc1 - pc1.mean(axis=0)
-            pc2_c = pc2 - pc2.mean(axis=0)
-            nbrs = NearestNeighbors(n_neighbors=1).fit(pc2_c)
-            _, indices = nbrs.kneighbors(pc1_c)
-            return indices.flatten().tolist()
-
-    def evaluate_hungarian(self, pc1: np.ndarray, pc2: np.ndarray,
-                          cells1_ids: List[str], cells2_ids: List[str]) -> List[int]:
-        """Hungarian algorithm on distance matrix"""
-        # Center point clouds
-        pc1_c = pc1 - pc1.mean(axis=0)
-        pc2_c = pc2 - pc2.mean(axis=0)
-
-        # Compute pairwise distances
-        from scipy.spatial.distance import cdist
-        cost_matrix = cdist(pc1_c, pc2_c, metric='euclidean')
-
-        # Handle size mismatch by padding
-        n1, n2 = len(pc1), len(pc2)
-        if n1 != n2:
-            max_n = max(n1, n2)
-            padded = np.full((max_n, max_n), cost_matrix.max() * 10)
-            padded[:n1, :n2] = cost_matrix
-            cost_matrix = padded
-
-        # Hungarian algorithm
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-        # Map back to original indices
-        matches = []
-        for i in range(len(pc1)):
-            if i < len(row_ind):
-                match_idx = col_ind[np.where(row_ind == i)[0][0]]
-                if match_idx < len(pc2):
-                    matches.append(match_idx)
-                else:
-                    matches.append(len(pc2))  # no-match
-            else:
-                matches.append(len(pc2))
-
-        return matches
-
-    def run_baseline_evaluation(self, dataloader, method: str) -> List[dict]:
-        """Run a baseline method on the dataset"""
-        results = []
-
-        for batch in tqdm(dataloader, desc=f"Evaluating {method}"):
-            pc1, pc2, mask1, mask2, match_indices, info_list = batch
-
-            B = pc1.shape[0]
-            for b in range(B):
-                n1 = int(mask1[b].sum().item())
-                n2 = int(mask2[b].sum().item())
-
-                pc1_np = pc1[b, :n1].numpy()
-                pc2_np = pc2[b, :n2].numpy()
-
-                info = info_list[b]
-                cells1_ids = info['cells1_ids'][:n1]
-                cells2_ids = info['cells2_ids'][:n2]
-
-                # Run baseline method
-                if method == 'icp':
-                    pred_matches = self.evaluate_icp(pc1_np, pc2_np, cells1_ids, cells2_ids)
-                elif method == 'cpd':
-                    pred_matches = self.evaluate_cpd(pc1_np, pc2_np, cells1_ids, cells2_ids)
-                elif method == 'hungarian':
-                    pred_matches = self.evaluate_hungarian(pc1_np, pc2_np, cells1_ids, cells2_ids)
-                else:
-                    raise ValueError(f"Unknown method: {method}")
-
-                # Compare with ground truth
-                for i in range(n1):
-                    target = match_indices[b, i].item()
-                    pred = pred_matches[i] if i < len(pred_matches) else n2
-
-                    is_match = target < n2
-                    is_correct = pred == target
-
-                    results.append({
-                        'pred': pred,
-                        'target': target,
-                        'is_match': is_match,
-                        'is_correct': is_correct,
-                        'n_cells1': n1,
-                        'method': method
                     })
+
+        # Compute final metrics
+        results = {
+            'loss': total_loss / batch_count if batch_count > 0 else 0,
+            'match_accuracy': match_correct / match_total if match_total > 0 else 0,
+            'match_correct': match_correct,
+            'match_total': match_total,
+            'outlier_accuracy': outlier_correct / outlier_total if outlier_total > 0 else 0,
+            'outlier_correct': outlier_correct,
+            'outlier_total': outlier_total,
+            'overall_accuracy': (match_correct + outlier_correct) / (match_total + outlier_total) if (match_total + outlier_total) > 0 else 0,
+            'detailed_results': all_results
+        }
 
         return results
 
 
 # =============================================================================
-# SECTION 3.3: ROBUSTNESS EVALUATION
+# KNN-BASED CELL IDENTIFICATION (Section 2.8)
 # =============================================================================
-class RobustnessEvaluator:
-    """Evaluate model robustness to perturbations"""
+class KNNIdentifier:
+    """KNN-based cell identification as described in paper Section 2.8"""
+
+    def __init__(self, k=30):
+        self.k = k
+        self.embeddings = None
+        self.labels = None
+
+    def fit(self, embeddings, labels):
+        """Build index from training embeddings"""
+        self.embeddings = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+        self.labels = labels
+        self.nn = NearestNeighbors(n_neighbors=min(self.k, len(embeddings)), metric='cosine')
+        self.nn.fit(self.embeddings)
+        print(f"  KNN index: {len(embeddings)} embeddings, k={self.k}")
+
+    def predict(self, queries):
+        """Predict cell IDs via majority vote"""
+        queries_norm = queries / (np.linalg.norm(queries, axis=1, keepdims=True) + 1e-8)
+        _, indices = self.nn.kneighbors(queries_norm)
+
+        predictions = []
+        confidences = []
+        for idx_list in indices:
+            neighbor_labels = [self.labels[i] for i in idx_list]
+            counts = Counter(neighbor_labels)
+            top, count = counts.most_common(1)[0]
+            predictions.append(top)
+            confidences.append(count / len(idx_list))
+
+        return predictions, confidences
+
+
+class KNNEvaluator:
+    """Evaluate KNN-based cell identification"""
 
     def __init__(self, model, config):
         self.model = model
         self.config = config
+        self.knn = KNNIdentifier(k=config.K_NEIGHBORS)
 
     @torch.no_grad()
-    def evaluate_with_perturbation(self, dataloader, perturbation_fn, desc=""):
-        """Evaluate with a perturbation applied to input"""
+    def extract_embeddings(self, dataloader, desc="Extracting"):
+        """Extract cell embeddings"""
         self.model.eval()
-        results = []
+        embeddings, labels, metadata = [], [], []
 
         for batch in tqdm(dataloader, desc=desc):
-            pc1, pc2, mask1, mask2, match_indices, info_list = batch
-
-            # Apply perturbation
-            pc1, pc2 = perturbation_fn(pc1, pc2, mask1, mask2)
-
+            pc1, pc2, mask1, mask2, _, info_list = batch
             pc1 = pc1.to(device)
             pc2 = pc2.to(device)
             mask1 = mask1.to(device)
             mask2 = mask2.to(device)
-            match_indices = match_indices.to(device)
 
-            z1, z2, temperature = self.model(pc1, pc2, mask1, mask2, epoch=100)
+            z1, _, _ = self.model(pc1, pc2, mask1, mask2, epoch=100)
+            z1_mean = z1[0] if self.model.use_uncertainty else z1
 
-            if self.model.use_uncertainty:
-                z1_mean, _ = z1
-                z2_mean, _ = z2
-                sims = torch.bmm(z1_mean, z2_mean.transpose(1, 2)) / temperature
-            else:
-                sims = torch.bmm(z1, z2.transpose(1, 2)) / temperature
+            for b in range(pc1.shape[0]):
+                n = int(mask1[b].sum().item())
+                info = info_list[b]
+                for i in range(n):
+                    embeddings.append(z1_mean[b, i].cpu().numpy())
+                    labels.append(info['cells1_ids'][i] if i < len(info['cells1_ids']) else f"cell_{i}")
+                    metadata.append({'n_cells': n, 'embryo': info['run1']})
 
-            pred_indices = sims.argmax(dim=-1)
+        return np.array(embeddings), labels, metadata
 
-            B = pc1.shape[0]
-            for b in range(B):
-                n_valid = int(mask1[b].sum().item())
-                for i in range(n_valid):
-                    pred = pred_indices[b, i].item()
-                    target = match_indices[b, i].item()
-                    n2 = int(mask2[b].sum().item()) + 1
+    def evaluate(self, train_loader, test_loader):
+        """Full KNN evaluation"""
+        print("\nBuilding KNN index from training data...")
+        train_emb, train_labels, _ = self.extract_embeddings(train_loader, "Train embeddings")
+        self.knn.fit(train_emb, train_labels)
 
-                    results.append({
-                        'pred': pred,
-                        'target': target,
-                        'is_match': target < n2 - 1,
-                        'is_correct': pred == target
-                    })
+        print("Evaluating on test data...")
+        test_emb, test_labels, test_meta = self.extract_embeddings(test_loader, "Test embeddings")
+        predictions, confidences = self.knn.predict(test_emb)
 
-        accuracy = sum(1 for r in results if r['is_correct']) / len(results) if results else 0
-        return accuracy, results
+        # Compute metrics
+        correct = [1 if p == t else 0 for p, t in zip(predictions, test_labels)]
+        mean_acc, ci_low, ci_high = bootstrap_ci(correct, self.config.N_BOOTSTRAP)
 
-    def missing_cells_perturbation(self, fraction: float):
-        """Create perturbation that removes cells"""
-        def perturb(pc1, pc2, mask1, mask2):
-            pc1 = pc1.clone()
-            mask1 = mask1.clone()
+        # By neighborhood size
+        size_results = {}
+        for name, (lo, hi) in [('sparse_5_10', (5, 10)), ('medium_11_15', (11, 15)), ('dense_16_20', (16, 20))]:
+            mask = [lo <= m['n_cells'] <= hi for m in test_meta]
+            if sum(mask) > 0:
+                bin_correct = [c for c, m in zip(correct, mask) if m]
+                acc, _, _ = bootstrap_ci(bin_correct, self.config.N_BOOTSTRAP)
+                size_results[name] = {'accuracy': acc, 'count': sum(mask)}
 
-            B = pc1.shape[0]
-            for b in range(B):
-                n_valid = int(mask1[b].sum().item())
-                n_remove = int(n_valid * fraction)
+        # Hierarchical accuracy
+        hier = {'exact': 0, 'sublineage': 0, 'founder': 0, 'binary': 0}
+        for pred, true in zip(predictions, test_labels):
+            if pred == true:
+                hier['exact'] += 1
+            if same_sublineage(pred, true):
+                hier['sublineage'] += 1
+            if same_founder(pred, true):
+                hier['founder'] += 1
+            true_ab = get_founder(true) == 'AB'
+            pred_ab = get_founder(pred) == 'AB'
+            if true_ab == pred_ab:
+                hier['binary'] += 1
 
-                if n_remove > 0 and n_valid - n_remove >= 4:
-                    valid_indices = torch.where(mask1[b] > 0)[0]
-                    remove_indices = valid_indices[torch.randperm(n_valid)[:n_remove]]
-                    mask1[b, remove_indices] = 0
-                    pc1[b, remove_indices] = 0
+        n = len(test_labels)
+        hier = {k: v / n for k, v in hier.items()}
 
-            return pc1, pc2
-        return perturb
-
-    def coordinate_noise_perturbation(self, scale: float):
-        """Create perturbation that adds coordinate noise"""
-        def perturb(pc1, pc2, mask1, mask2):
-            pc1 = pc1.clone()
-            pc2 = pc2.clone()
-
-            B = pc1.shape[0]
-            for b in range(B):
-                # Compute mean nearest neighbor distance for scaling
-                n1 = int(mask1[b].sum().item())
-                if n1 > 1:
-                    pts = pc1[b, :n1].numpy()
-                    nbrs = NearestNeighbors(n_neighbors=2).fit(pts)
-                    dists, _ = nbrs.kneighbors(pts)
-                    mean_nn_dist = dists[:, 1].mean()
-
-                    noise_std = scale * mean_nn_dist
-                    noise1 = torch.randn_like(pc1[b, :n1]) * noise_std
-                    pc1[b, :n1] += noise1
-
-                n2 = int(mask2[b].sum().item())
-                if n2 > 1:
-                    pts = pc2[b, :n2].numpy()
-                    nbrs = NearestNeighbors(n_neighbors=2).fit(pts)
-                    dists, _ = nbrs.kneighbors(pts)
-                    mean_nn_dist = dists[:, 1].mean()
-
-                    noise_std = scale * mean_nn_dist
-                    noise2 = torch.randn_like(pc2[b, :n2]) * noise_std
-                    pc2[b, :n2] += noise2
-
-            return pc1, pc2
-        return perturb
-
-    def no_perturbation(self):
-        """Identity perturbation"""
-        def perturb(pc1, pc2, mask1, mask2):
-            return pc1, pc2
-        return perturb
-
-    def run_missing_cells_sweep(self, dataloader):
-        """Sweep over different missing cell fractions"""
-        fractions = [0.0, 0.1, 0.2, 0.3, 0.4]
-        results = {}
-
-        for frac in fractions:
-            print(f"\nEvaluating with {int(frac*100)}% missing cells...")
-            if frac == 0:
-                acc, _ = self.evaluate_with_perturbation(
-                    dataloader, self.no_perturbation(), f"Missing 0%")
-            else:
-                acc, _ = self.evaluate_with_perturbation(
-                    dataloader, self.missing_cells_perturbation(frac),
-                    f"Missing {int(frac*100)}%")
-            results[frac] = acc
-            print(f"  Accuracy: {acc*100:.1f}%")
-
-        return results
-
-    def run_noise_sweep(self, dataloader):
-        """Sweep over different noise scales"""
-        scales = [0.0, 0.1, 0.2, 0.3, 0.5]
-        results = {}
-
-        for scale in scales:
-            print(f"\nEvaluating with {scale}x noise...")
-            if scale == 0:
-                acc, _ = self.evaluate_with_perturbation(
-                    dataloader, self.no_perturbation(), f"Noise 0.0x")
-            else:
-                acc, _ = self.evaluate_with_perturbation(
-                    dataloader, self.coordinate_noise_perturbation(scale),
-                    f"Noise {scale}x")
-            results[scale] = acc
-            print(f"  Accuracy: {acc*100:.1f}%")
-
-        return results
+        return {
+            'overall_accuracy': mean_acc,
+            'ci': (ci_low, ci_high),
+            'total': n,
+            'by_size': size_results,
+            'hierarchical': hier,
+            'test_embeddings': test_emb,
+            'test_labels': test_labels,
+            'predictions': predictions,
+            'confidences': confidences
+        }
 
 
 # =============================================================================
-# SECTION 3.4 & 3.5: ABLATION STUDIES
+# BASELINE METHODS
 # =============================================================================
-class AblationEvaluator:
-    """Evaluate ablated model variants"""
-
+class BaselineEvaluator:
     def __init__(self, config):
         self.config = config
 
-    def create_model_variant(self,
-                            use_sparse_features=True,
-                            use_uncertainty=True,
-                            use_learnable_no_match=True,
-                            use_relative_pos=True,
-                            use_density=True,
-                            use_count=True,
-                            use_centroid=True):
-        """Create a model variant with specified ablations"""
-        model = EnhancedTwinAttentionEncoder(
-            embed_dim=self.config.EMBED_DIM,
-            num_heads=self.config.NUM_HEADS,
-            num_layers=self.config.NUM_LAYERS,
-            dropout=self.config.DROPOUT,
-            use_sparse_features=use_sparse_features,
-            use_uncertainty=use_uncertainty,
-            use_learnable_no_match=use_learnable_no_match
-        )
-        return model.to(device)
+    def icp(self, pc1, pc2, iters=50):
+        src = pc1 - pc1.mean(0)
+        tgt = pc2 - pc2.mean(0)
+        for _ in range(iters):
+            nn = NearestNeighbors(n_neighbors=1).fit(tgt)
+            _, idx = nn.kneighbors(src)
+            matched = tgt[idx.flatten()]
+            H = src.T @ matched
+            U, _, Vt = np.linalg.svd(H)
+            src = src @ (Vt.T @ U.T).T
+        nn = NearestNeighbors(n_neighbors=1).fit(tgt)
+        _, idx = nn.kneighbors(src)
+        return idx.flatten()
 
-    @torch.no_grad()
-    def evaluate_model(self, model, dataloader, desc="Evaluating"):
-        """Evaluate a model variant"""
-        model.eval()
-        correct = 0
-        total = 0
+    def cpd(self, pc1, pc2):
+        src = (pc1 - pc1.mean(0)) / (pc1.std() + 1e-8)
+        tgt = (pc2 - pc2.mean(0)) / (pc2.std() + 1e-8)
+        nn = NearestNeighbors(n_neighbors=1).fit(tgt)
+        _, idx = nn.kneighbors(src)
+        return idx.flatten()
 
-        for batch in tqdm(dataloader, desc=desc):
-            pc1, pc2, mask1, mask2, match_indices, info_list = batch
-            pc1 = pc1.to(device)
-            pc2 = pc2.to(device)
-            mask1 = mask1.to(device)
-            mask2 = mask2.to(device)
-            match_indices = match_indices.to(device)
+    def hungarian(self, pc1, pc2):
+        from scipy.spatial.distance import cdist
+        src = pc1 - pc1.mean(0)
+        tgt = pc2 - pc2.mean(0)
+        cost = cdist(src, tgt)
+        n1, n2 = len(pc1), len(pc2)
+        if n1 != n2:
+            pad = np.full((max(n1, n2), max(n1, n2)), cost.max() * 10)
+            pad[:n1, :n2] = cost
+            cost = pad
+        row, col = linear_sum_assignment(cost)
+        return np.array([col[np.where(row == i)[0][0]] if i in row else n2 for i in range(n1)])
 
-            z1, z2, temperature = model(pc1, pc2, mask1, mask2, epoch=100)
+    def evaluate(self, dataloader, method):
+        """Evaluate baseline on match cases only"""
+        correct, total = 0, 0
 
-            if model.use_uncertainty:
-                z1_mean, _ = z1
-                z2_mean, _ = z2
-                sims = torch.bmm(z1_mean, z2_mean.transpose(1, 2)) / temperature
-            else:
-                sims = torch.bmm(z1, z2.transpose(1, 2)) / temperature
-
-            pred_indices = sims.argmax(dim=-1)
-
+        for batch in tqdm(dataloader, desc=f"Baseline: {method}"):
+            pc1, pc2, mask1, mask2, match_indices, _ = batch
             B = pc1.shape[0]
+
             for b in range(B):
-                n_valid = int(mask1[b].sum().item())
-                for i in range(n_valid):
-                    pred = pred_indices[b, i].item()
-                    target = match_indices[b, i].item()
-                    if pred == target:
-                        correct += 1
-                    total += 1
+                n1 = int(mask1[b].sum().item())
+                n2 = int(mask2[b].sum().item())
+                p1 = pc1[b, :n1].numpy()
+                p2 = pc2[b, :n2].numpy()
+
+                if method == 'icp':
+                    preds = self.icp(p1, p2)
+                elif method == 'cpd':
+                    preds = self.cpd(p1, p2)
+                elif method == 'hungarian':
+                    preds = self.hungarian(p1, p2)
+
+                for i in range(n1):
+                    tgt = match_indices[b, i].item()
+                    if tgt < n2:  # Only count match cases
+                        total += 1
+                        if i < len(preds) and preds[i] == tgt:
+                            correct += 1
 
         return correct / total if total > 0 else 0
 
 
 # =============================================================================
-# SECTION 3.6: EMBEDDING ANALYSIS
+# ROBUSTNESS EVALUATION
 # =============================================================================
-class EmbeddingAnalyzer:
-    """Analyze learned embedding structure"""
-
+class RobustnessEvaluator:
     def __init__(self, model, config):
         self.model = model
         self.config = config
+        self.loss_fn = TwinAttentionMatchingLoss(use_uncertainty=True)
 
     @torch.no_grad()
-    def extract_embeddings(self, dataloader) -> Tuple[np.ndarray, List[str], List[int]]:
-        """Extract embeddings for all cells"""
+    def evaluate_perturbed(self, dataloader, perturb_fn, desc=""):
+        """Evaluate with perturbation - reports match accuracy"""
         self.model.eval()
+        match_correct, match_total = 0, 0
 
-        all_embeddings = []
-        all_cell_ids = []
-        all_times = []
+        for batch in tqdm(dataloader, desc=desc):
+            pc1, pc2, mask1, mask2, match_indices, _ = batch
+            pc1, pc2, mask1, mask2 = perturb_fn(pc1, pc2, mask1, mask2)
 
-        for batch in tqdm(dataloader, desc="Extracting embeddings"):
-            pc1, pc2, mask1, mask2, match_indices, info_list = batch
             pc1 = pc1.to(device)
             pc2 = pc2.to(device)
             mask1 = mask1.to(device)
             mask2 = mask2.to(device)
+            match_indices = match_indices.to(device)
 
-            z1, z2, _ = self.model(pc1, pc2, mask1, mask2, epoch=100)
+            z1, z2, temp = self.model(pc1, pc2, mask1, mask2, epoch=100)
+            _, metrics = self.loss_fn(z1, z2, match_indices, temp, mask1, mask2)
 
-            if self.model.use_uncertainty:
-                z1_mean, _ = z1
-            else:
-                z1_mean = z1
+            match_correct += metrics['match_correct']
+            match_total += metrics['match_total']
 
-            B = pc1.shape[0]
-            for b in range(B):
-                n_valid = int(mask1[b].sum().item())
-                info = info_list[b]
+        return match_correct / match_total if match_total > 0 else 0
 
-                for i in range(n_valid):
-                    emb = z1_mean[b, i].cpu().numpy()
-                    cell_id = info['cells1_ids'][i] if i < len(info['cells1_ids']) else f"cell_{i}"
-                    time = info['time1']
+    def missing_cells(self, frac):
+        def fn(pc1, pc2, m1, m2):
+            pc1, m1 = pc1.clone(), m1.clone()
+            for b in range(pc1.shape[0]):
+                n = int(m1[b].sum())
+                n_rm = int(n * frac)
+                if n_rm > 0 and n - n_rm >= 4:
+                    valid = torch.where(m1[b] > 0)[0]
+                    rm = valid[torch.randperm(n)[:n_rm]]
+                    m1[b, rm] = 0
+                    pc1[b, rm] = 0
+            return pc1, pc2, m1, m2
+        return fn
 
-                    all_embeddings.append(emb)
-                    all_cell_ids.append(cell_id)
-                    all_times.append(time)
+    def coord_noise(self, scale):
+        def fn(pc1, pc2, m1, m2):
+            pc1, pc2 = pc1.clone(), pc2.clone()
+            for b in range(pc1.shape[0]):
+                for pc, m in [(pc1, m1), (pc2, m2)]:
+                    n = int(m[b].sum())
+                    if n > 1:
+                        pts = pc[b, :n].numpy()
+                        nn = NearestNeighbors(n_neighbors=2).fit(pts)
+                        d, _ = nn.kneighbors(pts)
+                        nn_dist = d[:, 1].mean()
+                        pc[b, :n] += torch.randn(n, 3) * (scale * nn_dist)
+            return pc1, pc2, m1, m2
+        return fn
 
-        return np.array(all_embeddings), all_cell_ids, all_times
+    def no_perturb(self):
+        return lambda p1, p2, m1, m2: (p1, p2, m1, m2)
 
-    def categorize_errors(self, results: List[dict]) -> dict:
-        """Categorize errors by type"""
-        error_types = {
-            'sibling': 0,
-            'parent_child': 0,
-            'same_lineage_nonadjacent': 0,
-            'distant_lineage': 0,
-            'random': 0
-        }
+    def run_sweeps(self, dataloader):
+        """Run missing cells and noise sweeps"""
+        missing = {}
+        for frac in [0.0, 0.1, 0.2, 0.3, 0.4]:
+            fn = self.no_perturb() if frac == 0 else self.missing_cells(frac)
+            acc = self.evaluate_perturbed(dataloader, fn, f"Missing {int(frac*100)}%")
+            missing[frac] = acc
+            print(f"  {int(frac*100)}% missing: {acc*100:.1f}%")
 
-        errors = [r for r in results if not r['is_correct'] and r['is_match']]
+        noise = {}
+        for scale in [0.0, 0.1, 0.2, 0.3, 0.5]:
+            fn = self.no_perturb() if scale == 0 else self.coord_noise(scale)
+            acc = self.evaluate_perturbed(dataloader, fn, f"Noise {scale}x")
+            noise[scale] = acc
+            print(f"  {scale}x noise: {acc*100:.1f}%")
 
-        for r in errors:
-            cell1 = str(r['cell1_id'])
-            pred_cell = str(r['pred_cell_id']) if r['pred_cell_id'] else ""
-
-            if not pred_cell:
-                error_types['random'] += 1
-            elif are_siblings(cell1, pred_cell):
-                error_types['sibling'] += 1
-            elif is_parent_child(cell1, pred_cell):
-                error_types['parent_child'] += 1
-            elif same_lineage_branch(cell1, pred_cell):
-                error_types['same_lineage_nonadjacent'] += 1
-            elif get_founder_lineage(cell1) != get_founder_lineage(pred_cell):
-                error_types['distant_lineage'] += 1
-            else:
-                error_types['random'] += 1
-
-        total_errors = sum(error_types.values())
-        error_percentages = {k: v / total_errors * 100 if total_errors > 0 else 0
-                           for k, v in error_types.items()}
-
-        return {
-            'counts': error_types,
-            'percentages': error_percentages,
-            'total_errors': total_errors
-        }
+        return {'missing': missing, 'noise': noise}
 
 
 # =============================================================================
-# FIGURE GENERATION
+# ERROR ANALYSIS
+# =============================================================================
+class ErrorAnalyzer:
+    def analyze(self, results):
+        """Categorize errors from KNN results"""
+        errors = [(r['predictions'][i], r['test_labels'][i])
+                  for i in range(len(r['test_labels']))
+                  if r['predictions'][i] != r['test_labels'][i]]
+        # Fix: use proper variable
+        errors = []
+        for i in range(len(results['test_labels'])):
+            if results['predictions'][i] != results['test_labels'][i]:
+                errors.append((results['predictions'][i], results['test_labels'][i]))
+
+        cats = {'sibling': 0, 'same_sublineage': 0, 'same_founder': 0, 'diff_founder': 0, 'unknown': 0}
+
+        for pred, true in errors:
+            p_founder = get_founder(pred)
+            t_founder = get_founder(true)
+
+            if p_founder == 'UNKNOWN' or t_founder == 'UNKNOWN':
+                cats['unknown'] += 1
+            elif are_siblings(pred, true):
+                cats['sibling'] += 1
+            elif same_sublineage(pred, true):
+                cats['same_sublineage'] += 1
+            elif p_founder == t_founder:
+                cats['same_founder'] += 1
+            else:
+                cats['diff_founder'] += 1
+
+        total = len(errors)
+        pcts = {k: (v / total * 100 if total > 0 else 0) for k, v in cats.items()}
+
+        return {'counts': cats, 'percentages': pcts, 'total': total}
+
+
+# =============================================================================
+# FIGURE GENERATION - Individual figures
 # =============================================================================
 class FigureGenerator:
-    """Generate all figures from the paper"""
-
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
+        plt.rcParams.update({'font.size': 11, 'axes.titlesize': 13})
 
-        # Set style
-        plt.style.use('seaborn-v0_8-whitegrid')
-        plt.rcParams['font.size'] = 10
-        plt.rcParams['axes.labelsize'] = 11
-        plt.rcParams['axes.titlesize'] = 12
+    def save(self, fig, name):
+        fig.savefig(os.path.join(self.output_dir, name), dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"  Saved: {name}")
 
-    def figure2_core_performance(self, metrics: dict, save_name="figure2_core_performance.png"):
-        """Generate Figure 2: Core identification performance"""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    def fig_matching_accuracy(self, metrics, name="fig_matching_accuracy.png"):
+        """Match and outlier accuracy - the main training metrics"""
+        fig, ax = plt.subplots(figsize=(7, 5))
 
-        # Panel A: Overall accuracy (simulated vs real)
-        ax = axes[0, 0]
-        categories = ['Simulated']
-        accuracies = [metrics.get('overall_accuracy', 0) * 100]
-        cis = [metrics.get('overall_accuracy_ci', (0, 0))]
+        cats = ['Match\nAccuracy', 'Outlier\nAccuracy', 'Overall\nAccuracy']
+        vals = [metrics['match_accuracy'] * 100,
+                metrics['outlier_accuracy'] * 100,
+                metrics['overall_accuracy'] * 100]
+        counts = [metrics['match_total'], metrics['outlier_total'],
+                  metrics['match_total'] + metrics['outlier_total']]
 
-        if 'real_overall_accuracy' in metrics:
-            categories.append('Real')
-            accuracies.append(metrics['real_overall_accuracy'] * 100)
-            cis.append(metrics.get('real_overall_accuracy_ci', (0, 0)))
+        colors = ['#4CAF50', '#FF9800', '#2196F3']
+        bars = ax.bar(cats, vals, color=colors)
 
-        bars = ax.bar(categories, accuracies, color=['#2196F3', '#4CAF50'][:len(categories)])
-
-        # Add error bars
-        for i, (acc, ci) in enumerate(zip(accuracies, cis)):
-            yerr = [[acc - ci[0]*100], [ci[1]*100 - acc]]
-            ax.errorbar(i, acc, yerr=yerr, fmt='none', color='black', capsize=5)
-
+        ax.axhline(90, color='red', linestyle='--', alpha=0.5, label='90% target')
         ax.set_ylabel('Accuracy (%)')
-        ax.set_title('A  Overall accuracy (simulated vs. real)')
-        ax.set_ylim(80, 100)
-
-        # Add value labels
-        for bar, acc in zip(bars, accuracies):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                   f'{acc:.1f}%', ha='center', va='bottom', fontsize=10)
-
-        # Panel B: Accuracy by developmental stage
-        ax = axes[0, 1]
-        stages = ['4-20', '21-50', '51-100', '101-150', '151-194']
-        stage_accs = []
-        stage_cis = []
-
-        for stage in ['4_20', '21_50', '51_100', '101_150', '151_194']:
-            acc = metrics.get(f'stage_{stage}_accuracy', 0) * 100
-            ci = metrics.get(f'stage_{stage}_ci', (0, 0))
-            stage_accs.append(acc)
-            stage_cis.append(ci)
-
-        x = range(len(stages))
-        ax.plot(x, stage_accs, 'o-', color='#2196F3', linewidth=2, markersize=8)
-
-        # Add error bands
-        lowers = [ci[0]*100 for ci in stage_cis]
-        uppers = [ci[1]*100 for ci in stage_cis]
-        ax.fill_between(x, lowers, uppers, alpha=0.2, color='#2196F3')
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(stages)
-        ax.set_xlabel('Cell-count stage bin')
-        ax.set_ylabel('Accuracy (%)')
-        ax.set_title('B  Accuracy by developmental stage')
-        ax.set_ylim(85, 100)
-
-        # Panel C: Hierarchical identification
-        ax = axes[1, 0]
-        hier_names = ['Exact ID', 'Sub-lineage', 'Founder', 'Binary']
-        hier_accs = [
-            metrics.get('hierarchical_exact', 0) * 100,
-            metrics.get('hierarchical_sublineage', 0) * 100,
-            metrics.get('hierarchical_founder', 0) * 100,
-            metrics.get('hierarchical_binary', 0) * 100
-        ]
-
-        bars = ax.bar(hier_names, hier_accs, color='#2196F3')
-        ax.set_ylabel('Accuracy (%)')
-        ax.set_title('C  Hierarchical identification')
-        ax.set_ylim(90, 100)
-
-        for bar, acc in zip(bars, hier_accs):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
-                   f'{acc:.1f}%', ha='center', va='bottom', fontsize=9)
-
-        # Panel D: Performance by correspondence type
-        ax = axes[1, 1]
-        corr_types = ['Match', 'No-match']
-        corr_accs = [
-            metrics.get('match_accuracy', 0) * 100,
-            metrics.get('nomatch_accuracy', 0) * 100
-        ]
-
-        bars = ax.bar(corr_types, corr_accs, color='#2196F3')
-        ax.set_ylabel('Accuracy (%)')
-        ax.set_title('D  Performance by correspondence type')
-        ax.set_ylim(80, 100)
-
-        for bar, acc in zip(bars, corr_accs):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
-                   f'{acc:.1f}%', ha='center', va='bottom', fontsize=9)
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, save_name), dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: {save_name}")
-
-    def figure3_baseline_comparison(self, baseline_results: dict,
-                                    model_accuracy: float,
-                                    save_name="figure3_baseline_comparison.png"):
-        """Generate Figure 3: Baseline method comparison"""
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        methods = ['ICP', 'CPD', 'Hungarian', 'Siamese', 'Joint Attention']
-        accuracies = [
-            baseline_results.get('icp', 0) * 100,
-            baseline_results.get('cpd', 0) * 100,
-            baseline_results.get('hungarian', 0) * 100,
-            baseline_results.get('siamese', 0) * 100,
-            model_accuracy * 100
-        ]
-
-        colors = ['#FFA726', '#FFA726', '#FFA726', '#42A5F5', '#2196F3']
-        bars = ax.bar(methods, accuracies, color=colors)
-
-        ax.axhline(y=90, color='red', linestyle='--', alpha=0.7, label='90% threshold')
-        ax.set_ylabel('Accuracy (%)')
-        ax.set_title('Baseline method comparison')
-        ax.set_ylim(40, 100)
+        ax.set_ylim(0, 100)
+        ax.set_title('Direct Matching Performance\n(Same as Training Metrics)')
         ax.legend()
 
-        for bar, acc in zip(bars, accuracies):
+        for bar, v, n in zip(bars, vals, counts):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                   f'{acc:.1f}%', ha='center', va='bottom', fontsize=10)
+                   f'{v:.1f}%\n(n={n})', ha='center', fontsize=10)
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, save_name), dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: {save_name}")
+        self.save(fig, name)
 
-    def figure4_robustness(self, missing_results: dict, noise_results: dict,
-                          save_name="figure4_robustness.png"):
-        """Generate Figure 4: Robustness to perturbations"""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    def fig_knn_accuracy(self, results, name="fig_knn_accuracy.png"):
+        """KNN identification accuracy"""
+        fig, ax = plt.subplots(figsize=(5, 5))
 
-        # Panel A: Missing cells
-        ax = axes[0, 0]
-        fracs = sorted(missing_results.keys())
-        accs = [missing_results[f] * 100 for f in fracs]
-        ax.plot([f*100 for f in fracs], accs, 'o-', color='#2196F3', linewidth=2, markersize=8)
-        ax.axhline(y=85, color='red', linestyle='--', alpha=0.5)
-        ax.set_xlabel('Cells removed (%)')
+        acc = results['overall_accuracy'] * 100
+        ci = results['ci']
+
+        ax.bar(['KNN\nIdentification'], [acc], color='#2196F3', width=0.5)
+        ax.errorbar(0, acc, yerr=[[acc - ci[0]*100], [ci[1]*100 - acc]],
+                   fmt='none', color='black', capsize=8, linewidth=2)
+
+        ax.axhline(90, color='red', linestyle='--', alpha=0.5)
         ax.set_ylabel('Accuracy (%)')
-        ax.set_title('A  Missing cells')
-        ax.set_ylim(65, 100)
+        ax.set_ylim(0, 100)
+        ax.set_title(f'KNN Cell Identification (k={30})\nn={results["total"]}')
+        ax.text(0, acc + 3, f'{acc:.1f}%', ha='center', fontsize=14, fontweight='bold')
 
-        # Panel B: Coordinate noise
-        ax = axes[0, 1]
-        scales = sorted(noise_results.keys())
-        accs = [noise_results[s] * 100 for s in scales]
-        ax.plot(scales, accs, 'o-', color='#2196F3', linewidth=2, markersize=8)
-        ax.set_xlabel('Noise scale (× mean NN distance)')
+        self.save(fig, name)
+
+    def fig_accuracy_by_size(self, results, name="fig_accuracy_by_size.png"):
+        """Accuracy by neighborhood size"""
+        fig, ax = plt.subplots(figsize=(7, 5))
+
+        sizes = ['Sparse\n(5-10)', 'Medium\n(11-15)', 'Dense\n(16-20)']
+        keys = ['sparse_5_10', 'medium_11_15', 'dense_16_20']
+
+        accs = [results['by_size'].get(k, {}).get('accuracy', 0) * 100 for k in keys]
+        counts = [results['by_size'].get(k, {}).get('count', 0) for k in keys]
+
+        bars = ax.bar(sizes, accs, color=['#81D4FA', '#29B6F6', '#0288D1'])
+        ax.axhline(90, color='red', linestyle='--', alpha=0.5)
         ax.set_ylabel('Accuracy (%)')
-        ax.set_title('B  Coordinate noise')
-        ax.set_ylim(75, 100)
+        ax.set_ylim(80, 100)
+        ax.set_title('KNN Accuracy by Neighborhood Size')
 
-        # Panel C: Summary bar chart
-        ax = axes[1, 0]
-        conditions = ['Baseline', '10% missing', '20% missing', '0.1× noise', '0.2× noise']
-        cond_accs = [
-            missing_results.get(0.0, 0) * 100,
-            missing_results.get(0.1, 0) * 100,
-            missing_results.get(0.2, 0) * 100,
-            noise_results.get(0.1, 0) * 100,
-            noise_results.get(0.2, 0) * 100
-        ]
-        bars = ax.bar(conditions, cond_accs, color='#2196F3')
-        ax.set_ylabel('Accuracy (%)')
-        ax.set_title('C  Perturbation summary')
-        ax.set_ylim(75, 100)
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        for bar, a, n in zip(bars, accs, counts):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                   f'{a:.1f}%\n(n={n})', ha='center', fontsize=10)
 
-        # Panel D: Combined perturbations (placeholder)
-        ax = axes[1, 1]
-        ax.text(0.5, 0.5, 'Combined perturbations\n(requires temporal data)',
-               ha='center', va='center', transform=ax.transAxes, fontsize=12)
-        ax.set_title('D  Combined perturbations')
+        self.save(fig, name)
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, save_name), dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: {save_name}")
+    def fig_hierarchical(self, results, name="fig_hierarchical.png"):
+        """Hierarchical accuracy"""
+        fig, ax = plt.subplots(figsize=(8, 5))
 
-    def figure5_feature_contributions(self, feature_results: dict,
-                                      save_name="figure5_feature_contributions.png"):
-        """Generate Figure 5: Feature contributions"""
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        levels = ['Exact\nCell ID', 'Sub-\nlineage', 'Founder\nLineage', 'Binary\n(AB vs other)']
+        hier = results['hierarchical']
+        accs = [hier['exact'] * 100, hier['sublineage'] * 100,
+                hier['founder'] * 100, hier['binary'] * 100]
 
-        # Panel A: Progressive addition
-        ax = axes[0]
-        if 'progressive' in feature_results:
-            stages = list(feature_results['progressive'].keys())
-            accs = [feature_results['progressive'][s] * 100 for s in stages]
-            bars = ax.bar(stages, accs, color='#2196F3')
-            ax.set_ylabel('Accuracy (%)')
-            ax.set_title('A  Progressive addition of geometric features')
-            ax.set_ylim(65, 100)
-            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-
-            for bar, acc in zip(bars, accs):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                       f'{acc:.1f}%', ha='center', va='bottom', fontsize=9)
-
-        # Panel B: Ablation
-        ax = axes[1]
-        if 'ablation' in feature_results:
-            features = list(feature_results['ablation'].keys())
-            accs = [feature_results['ablation'][f] * 100 for f in features]
-            colors = ['#4CAF50' if f == 'Full' else '#F44336' for f in features]
-            bars = ax.bar(features, accs, color=colors)
-            ax.set_ylabel('Accuracy (%)')
-            ax.set_title('B  Individual feature ablation')
-            ax.set_ylim(70, 100)
-
-            for bar, acc in zip(bars, accs):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                       f'{acc:.1f}%', ha='center', va='bottom', fontsize=9)
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, save_name), dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: {save_name}")
-
-    def figure6_architecture_ablation(self, arch_results: dict,
-                                      save_name="figure6_architecture_ablation.png"):
-        """Generate Figure 6: Architectural component ablation"""
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        components = list(arch_results.keys())
-        accs = [arch_results[c] * 100 for c in components]
-
-        colors = ['#4CAF50' if c == 'Full model' else '#F44336' for c in components]
-        bars = ax.bar(components, accs, color=colors)
+        colors = ['#1565C0', '#1976D2', '#2196F3', '#64B5F6']
+        bars = ax.bar(levels, accs, color=colors)
 
         ax.set_ylabel('Accuracy (%)')
-        ax.set_title('Architectural component ablation')
-        ax.set_ylim(60, 100)
+        ax.set_ylim(0, 100)
+        ax.set_title('Hierarchical Identification Accuracy')
 
-        for bar, acc in zip(bars, accs):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                   f'{acc:.1f}%', ha='center', va='bottom', fontsize=10)
+        for bar, a in zip(bars, accs):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                   f'{a:.1f}%', ha='center', fontsize=11, fontweight='bold')
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, save_name), dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: {save_name}")
+        self.save(fig, name)
 
-    def figure7_embedding_analysis(self, embeddings: np.ndarray, cell_ids: List[str],
-                                   error_analysis: dict,
-                                   save_name="figure7_embedding_analysis.png"):
-        """Generate Figure 7: Embedding structure and error analysis"""
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    def fig_baseline_comparison(self, baselines, our_acc, name="fig_baseline_comparison.png"):
+        """Baseline method comparison"""
+        fig, ax = plt.subplots(figsize=(9, 5))
 
-        # Panel A: t-SNE visualization
-        ax = axes[0]
-        if len(embeddings) > 0:
-            # Subsample if too many points
-            max_points = 3000
-            if len(embeddings) > max_points:
-                idx = np.random.choice(len(embeddings), max_points, replace=False)
-                emb_subset = embeddings[idx]
-                ids_subset = [cell_ids[i] for i in idx]
-            else:
-                emb_subset = embeddings
-                ids_subset = cell_ids
+        methods = ['ICP', 'CPD', 'Hungarian', 'Twin Attention\n(Ours)']
+        accs = [baselines['icp'] * 100, baselines['cpd'] * 100,
+                baselines['hungarian'] * 100, our_acc * 100]
 
-            # Run t-SNE
-            print("Running t-SNE...")
-            tsne = TSNE(n_components=2, perplexity=min(30, len(emb_subset)//4),
-                       random_state=42, max_iter=1000)
-            emb_2d = tsne.fit_transform(emb_subset)
+        colors = ['#BDBDBD', '#9E9E9E', '#757575', '#2196F3']
+        bars = ax.bar(methods, accs, color=colors)
 
-            # Color by founder lineage
-            founders = [get_founder_lineage(cid) for cid in ids_subset]
-            unique_founders = list(set(founders))
-            founder_colors = {f: plt.cm.tab10(i) for i, f in enumerate(unique_founders)}
-            colors = [founder_colors[f] for f in founders]
+        ax.axhline(50, color='red', linestyle='--', alpha=0.5, label='Random')
+        ax.set_ylabel('Match Accuracy (%)')
+        ax.set_ylim(0, 100)
+        ax.set_title('Baseline Method Comparison')
+        ax.legend()
 
-            ax.scatter(emb_2d[:, 0], emb_2d[:, 1], c=colors, s=5, alpha=0.6)
-            ax.set_xlabel('t-SNE 1')
-            ax.set_ylabel('t-SNE 2')
-            ax.set_title('A  t-SNE by founder lineage')
+        for bar, a in zip(bars, accs):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                   f'{a:.1f}%', ha='center', fontsize=11, fontweight='bold')
 
-            # Add legend
-            for f in unique_founders:
-                ax.scatter([], [], c=[founder_colors[f]], label=f, s=30)
-            ax.legend(loc='upper right', fontsize=8)
+        self.save(fig, name)
 
-        # Panel B: Error type distribution
-        ax = axes[1]
-        if error_analysis and 'percentages' in error_analysis:
-            labels = ['Sibling', 'Parent-child', 'Same-lineage\nnon-adjacent',
-                     'Distant lineage', 'Random']
-            sizes = [
-                error_analysis['percentages'].get('sibling', 0),
-                error_analysis['percentages'].get('parent_child', 0),
-                error_analysis['percentages'].get('same_lineage_nonadjacent', 0),
-                error_analysis['percentages'].get('distant_lineage', 0),
-                error_analysis['percentages'].get('random', 0)
-            ]
-            colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+    def fig_robustness_missing(self, results, name="fig_robustness_missing.png"):
+        """Missing cells robustness"""
+        fig, ax = plt.subplots(figsize=(7, 5))
 
-            # Filter out zero values
-            nonzero = [(l, s, c) for l, s, c in zip(labels, sizes, colors) if s > 0]
-            if nonzero:
-                labels, sizes, colors = zip(*nonzero)
-                ax.pie(sizes, labels=labels, colors=colors, autopct='%1.0f%%',
-                      startangle=90, pctdistance=0.75)
+        fracs = sorted(results['missing'].keys())
+        accs = [results['missing'][f] * 100 for f in fracs]
 
-            ax.set_title(f'B  Error type distribution (n={error_analysis.get("total_errors", 0)})')
+        ax.plot([f*100 for f in fracs], accs, 'o-', color='#2196F3',
+               linewidth=2, markersize=10, markerfacecolor='white', markeredgewidth=2)
+        ax.axhline(80, color='red', linestyle='--', alpha=0.5, label='80% threshold')
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, save_name), dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: {save_name}")
+        ax.set_xlabel('Cells Removed (%)')
+        ax.set_ylabel('Match Accuracy (%)')
+        ax.set_title('Robustness to Missing Cells')
+        ax.set_ylim(50, 100)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        for f, a in zip(fracs, accs):
+            ax.annotate(f'{a:.1f}%', (f*100, a), textcoords="offset points",
+                       xytext=(0, 10), ha='center', fontsize=9)
+
+        self.save(fig, name)
+
+    def fig_robustness_noise(self, results, name="fig_robustness_noise.png"):
+        """Coordinate noise robustness"""
+        fig, ax = plt.subplots(figsize=(7, 5))
+
+        scales = sorted(results['noise'].keys())
+        accs = [results['noise'][s] * 100 for s in scales]
+
+        ax.plot(scales, accs, 's-', color='#4CAF50',
+               linewidth=2, markersize=10, markerfacecolor='white', markeredgewidth=2)
+        ax.axhline(80, color='red', linestyle='--', alpha=0.5, label='80% threshold')
+
+        ax.set_xlabel('Noise Scale (× mean NN distance)')
+        ax.set_ylabel('Match Accuracy (%)')
+        ax.set_title('Robustness to Coordinate Noise')
+        ax.set_ylim(50, 100)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        for s, a in zip(scales, accs):
+            ax.annotate(f'{a:.1f}%', (s, a), textcoords="offset points",
+                       xytext=(0, 10), ha='center', fontsize=9)
+
+        self.save(fig, name)
+
+    def fig_embedding_tsne(self, embeddings, labels, name="fig_embedding_tsne.png"):
+        """t-SNE of embeddings"""
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+        # Subsample
+        max_pts = 3000
+        if len(embeddings) > max_pts:
+            idx = np.random.choice(len(embeddings), max_pts, replace=False)
+            emb = embeddings[idx]
+            labs = [labels[i] for i in idx]
+        else:
+            emb, labs = embeddings, labels
+
+        print("  Running t-SNE...")
+        tsne = TSNE(n_components=2, perplexity=min(30, len(emb)//4), random_state=42, max_iter=1000)
+        emb_2d = tsne.fit_transform(emb)
+
+        founders = [get_founder(l) for l in labs]
+        unique = sorted(set(founders))
+        cmap = plt.cm.get_cmap('tab10', len(unique))
+        colors = {f: cmap(i) for i, f in enumerate(unique)}
+
+        for f in unique:
+            mask = [fo == f for fo in founders]
+            pts = emb_2d[mask]
+            if f != 'UNKNOWN':
+                ax.scatter(pts[:, 0], pts[:, 1], c=[colors[f]], s=8, alpha=0.6, label=f)
+
+        ax.legend(title='Founder', loc='upper right')
+        ax.set_xlabel('t-SNE 1')
+        ax.set_ylabel('t-SNE 2')
+        ax.set_title('Embedding Space by Lineage')
+
+        self.save(fig, name)
+
+    def fig_error_distribution(self, errors, name="fig_error_distribution.png"):
+        """Error distribution pie"""
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        labels_map = {
+            'sibling': 'Sibling',
+            'same_sublineage': 'Same Sub-lineage',
+            'same_founder': 'Same Founder',
+            'diff_founder': 'Different Founder'
+        }
+
+        labels, sizes, colors = [], [], ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+        for i, (k, lbl) in enumerate(labels_map.items()):
+            pct = errors['percentages'].get(k, 0)
+            if pct > 0:
+                labels.append(f'{lbl}\n(n={errors["counts"].get(k, 0)})')
+                sizes.append(pct)
+
+        if sizes:
+            ax.pie(sizes, labels=labels, colors=colors[:len(sizes)],
+                  autopct='%1.1f%%', startangle=90, pctdistance=0.75)
+            ax.set_title(f'Error Distribution (n={errors["total"]})')
+        else:
+            ax.text(0.5, 0.5, 'No categorizable errors', ha='center', va='center')
+
+        self.save(fig, name)
+
+    def fig_confidence_histogram(self, results, name="fig_confidence_histogram.png"):
+        """Confidence distribution"""
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        correct_conf = [results['confidences'][i] for i in range(len(results['test_labels']))
+                       if results['predictions'][i] == results['test_labels'][i]]
+        wrong_conf = [results['confidences'][i] for i in range(len(results['test_labels']))
+                     if results['predictions'][i] != results['test_labels'][i]]
+
+        bins = np.linspace(0, 1, 21)
+        ax.hist(correct_conf, bins, alpha=0.7, label=f'Correct (n={len(correct_conf)})', color='#4CAF50')
+        ax.hist(wrong_conf, bins, alpha=0.7, label=f'Wrong (n={len(wrong_conf)})', color='#F44336')
+
+        ax.set_xlabel('KNN Confidence (% neighbors agreeing)')
+        ax.set_ylabel('Count')
+        ax.set_title('Prediction Confidence Distribution')
+        ax.legend()
+
+        self.save(fig, name)
 
 
 # =============================================================================
 # MAIN EVALUATION RUNNER
 # =============================================================================
 class EvaluationRunner:
-    """Main class to run all evaluations"""
-
-    def __init__(self, config: EvalConfig):
+    def __init__(self, config):
         self.config = config
         self.results = {}
-
-        # Create output directories
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
         os.makedirs(config.FIGURE_DIR, exist_ok=True)
-
         self.fig_gen = FigureGenerator(config.FIGURE_DIR)
 
-    def run_full_evaluation(self):
-        """Run all evaluations from the paper"""
+    def run(self):
         print("\n" + "="*70)
-        print("TWIN ATTENTION MODEL EVALUATION SUITE")
+        print("TWIN ATTENTION MODEL - COMPREHENSIVE EVALUATION")
         print("="*70)
 
-        # Load data and model
         data = load_data(self.config)
         model = load_model(self.config)
 
-        # Check what data is available
-        eval_data = data.get('eval') or data.get('train')
-        if eval_data is None:
-            print("\nERROR: No evaluation data available!")
-            print("Please ensure data files exist at the specified paths.")
-            return self.results
+        train_data = data.get('train')
+        eval_data = data.get('eval') or train_data
 
-        # Create evaluation dataset
-        print("\nCreating evaluation dataset...")
-        eval_dataset = SparseEmbryoDataset(
-            eval_data,
-            stage_limit=self.config.STAGE_LIMIT,
-            min_cells=self.config.MIN_CELLS,
-            max_cells=self.config.MAX_CELLS,
-            augment=False,
-            num_rotations=1
-        )
+        if not eval_data:
+            print("ERROR: No data!")
+            return
 
-        eval_loader = DataLoader(
-            eval_dataset,
-            batch_size=self.config.BATCH_SIZE,
-            shuffle=False,
-            collate_fn=collate_fn_with_padding,
-            num_workers=0
-        )
+        # Create datasets
+        print("\nCreating datasets...")
+        if train_data:
+            train_ds = SparseEmbryoDataset(train_data, stage_limit=self.config.STAGE_LIMIT,
+                                           min_cells=self.config.MIN_CELLS, max_cells=self.config.MAX_CELLS,
+                                           augment=False, num_rotations=1)
+            train_loader = DataLoader(train_ds, batch_size=self.config.BATCH_SIZE,
+                                      shuffle=False, collate_fn=collate_fn_with_padding, num_workers=0)
+
+        eval_ds = SparseEmbryoDataset(eval_data, stage_limit=self.config.STAGE_LIMIT,
+                                      min_cells=self.config.MIN_CELLS, max_cells=self.config.MAX_CELLS,
+                                      augment=False, num_rotations=1)
+        eval_loader = DataLoader(eval_ds, batch_size=self.config.BATCH_SIZE,
+                                 shuffle=False, collate_fn=collate_fn_with_padding, num_workers=0)
 
         # =================================================================
-        # SECTION 3.1: Core Performance
+        # SECTION 3.1: Core Performance - Direct Matching (same as training)
         # =================================================================
         print("\n" + "="*60)
-        print("SECTION 3.1: CORE IDENTIFICATION PERFORMANCE")
+        print("SECTION 3.1: CORE PERFORMANCE")
         print("="*60)
 
-        core_eval = CorePerformanceEvaluator(model, self.config)
-        results = core_eval.evaluate_dataset(eval_loader, "Core evaluation")
-        metrics = core_eval.compute_metrics(results)
+        print("\n--- Direct Matching (Training Metrics) ---")
+        match_eval = MatchingEvaluator(model, self.config)
+        match_results = match_eval.evaluate(eval_loader, "Direct Matching")
 
-        self.results['core_performance'] = metrics
+        print(f"\n  Match Accuracy: {match_results['match_accuracy']*100:.1f}% ({match_results['match_correct']}/{match_results['match_total']})")
+        print(f"  Outlier Accuracy: {match_results['outlier_accuracy']*100:.1f}% ({match_results['outlier_correct']}/{match_results['outlier_total']})")
+        print(f"  Overall Accuracy: {match_results['overall_accuracy']*100:.1f}%")
+        print(f"  Loss: {match_results['loss']:.4f}")
 
-        print(f"\nCore Performance Results:")
-        print(f"  Total predictions: {metrics.get('total_predictions', 0)}")
-        print(f"  Overall accuracy: {metrics.get('overall_accuracy', 0)*100:.1f}%")
-        if 'overall_accuracy_ci' in metrics:
-            ci = metrics['overall_accuracy_ci']
-            print(f"    95% CI: [{ci[0]*100:.1f}%, {ci[1]*100:.1f}%]")
-        print(f"  Match accuracy: {metrics.get('match_accuracy', 0)*100:.1f}%")
-        print(f"  No-match accuracy: {metrics.get('nomatch_accuracy', 0)*100:.1f}%")
+        self.results['matching'] = match_results
 
-        print(f"\n  By neighborhood size:")
-        for key in ['sparse_5_10', 'medium_11_15', 'dense_16_20']:
-            if f'{key}_accuracy' in metrics:
-                print(f"    {key}: {metrics[f'{key}_accuracy']*100:.1f}% (n={metrics.get(f'{key}_count', 0)})")
+        # KNN Identification
+        print("\n--- KNN Cell Identification ---")
+        knn_eval = KNNEvaluator(model, self.config)
+        knn_results = knn_eval.evaluate(train_loader, eval_loader)
 
-        print(f"\n  By developmental stage:")
-        for stage in ['4_20', '21_50', '51_100', '101_150', '151_194']:
-            if f'stage_{stage}_accuracy' in metrics:
-                print(f"    {stage} cells: {metrics[f'stage_{stage}_accuracy']*100:.1f}%")
+        print(f"\n  KNN Accuracy: {knn_results['overall_accuracy']*100:.1f}%")
+        print(f"    95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]")
+        print(f"\n  By size:")
+        for k, v in knn_results['by_size'].items():
+            print(f"    {k}: {v['accuracy']*100:.1f}% (n={v['count']})")
+        print(f"\n  Hierarchical:")
+        for k, v in knn_results['hierarchical'].items():
+            print(f"    {k}: {v*100:.1f}%")
 
-        print(f"\n  Hierarchical accuracy:")
-        print(f"    Exact: {metrics.get('hierarchical_exact', 0)*100:.1f}%")
-        print(f"    Sub-lineage: {metrics.get('hierarchical_sublineage', 0)*100:.1f}%")
-        print(f"    Founder: {metrics.get('hierarchical_founder', 0)*100:.1f}%")
-        print(f"    Binary: {metrics.get('hierarchical_binary', 0)*100:.1f}%")
+        self.results['knn'] = knn_results
 
-        # Generate Figure 2
-        self.fig_gen.figure2_core_performance(metrics)
+        # Generate Section 3.1 figures
+        print("\nGenerating Section 3.1 figures...")
+        self.fig_gen.fig_matching_accuracy(match_results)
+        self.fig_gen.fig_knn_accuracy(knn_results)
+        self.fig_gen.fig_accuracy_by_size(knn_results)
+        self.fig_gen.fig_hierarchical(knn_results)
 
         # =================================================================
-        # SECTION 3.2: Baseline Comparisons
+        # SECTION 3.2: Baselines
         # =================================================================
         print("\n" + "="*60)
-        print("SECTION 3.2: BASELINE METHOD COMPARISON")
+        print("SECTION 3.2: BASELINE COMPARISON")
         print("="*60)
 
         baseline_eval = BaselineEvaluator(self.config)
-        baseline_results = {}
-
+        baselines = {}
         for method in ['icp', 'cpd', 'hungarian']:
-            print(f"\nEvaluating {method.upper()}...")
-            method_results = baseline_eval.run_baseline_evaluation(eval_loader, method)
-            accuracy = sum(1 for r in method_results if r['is_correct']) / len(method_results)
-            baseline_results[method] = accuracy
-            print(f"  {method.upper()} accuracy: {accuracy*100:.1f}%")
+            acc = baseline_eval.evaluate(eval_loader, method)
+            baselines[method] = acc
+            print(f"  {method.upper()}: {acc*100:.1f}%")
 
-        # Note: Siamese baseline would require training a separate model
-        baseline_results['siamese'] = 0.0  # Placeholder
+        self.results['baselines'] = baselines
 
-        self.results['baseline_comparison'] = baseline_results
-
-        # Generate Figure 3
-        self.fig_gen.figure3_baseline_comparison(
-            baseline_results,
-            metrics.get('overall_accuracy', 0)
-        )
+        print("\nGenerating Section 3.2 figure...")
+        self.fig_gen.fig_baseline_comparison(baselines, match_results['match_accuracy'])
 
         # =================================================================
-        # SECTION 3.3: Robustness Evaluation
+        # SECTION 3.3: Robustness
         # =================================================================
         print("\n" + "="*60)
-        print("SECTION 3.3: ROBUSTNESS TO PERTURBATIONS")
+        print("SECTION 3.3: ROBUSTNESS")
         print("="*60)
 
         robust_eval = RobustnessEvaluator(model, self.config)
+        robust_results = robust_eval.run_sweeps(eval_loader)
+        self.results['robustness'] = robust_results
 
-        print("\n--- Missing Cells Sweep ---")
-        missing_results = robust_eval.run_missing_cells_sweep(eval_loader)
-
-        print("\n--- Coordinate Noise Sweep ---")
-        noise_results = robust_eval.run_noise_sweep(eval_loader)
-
-        self.results['robustness'] = {
-            'missing_cells': missing_results,
-            'coordinate_noise': noise_results
-        }
-
-        # Generate Figure 4
-        self.fig_gen.figure4_robustness(missing_results, noise_results)
+        print("\nGenerating Section 3.3 figures...")
+        self.fig_gen.fig_robustness_missing(robust_results)
+        self.fig_gen.fig_robustness_noise(robust_results)
 
         # =================================================================
-        # SECTION 3.6: Embedding Analysis
+        # SECTION 3.6: Embedding & Error Analysis
         # =================================================================
         print("\n" + "="*60)
-        print("SECTION 3.6: EMBEDDING ANALYSIS")
+        print("SECTION 3.6: EMBEDDING & ERROR ANALYSIS")
         print("="*60)
 
-        emb_analyzer = EmbeddingAnalyzer(model, self.config)
+        error_analyzer = ErrorAnalyzer()
+        errors = error_analyzer.analyze(knn_results)
+        print(f"\n  Total errors: {errors['total']}")
+        for k, v in errors['percentages'].items():
+            if v > 0:
+                print(f"    {k}: {v:.1f}%")
 
-        print("\nExtracting embeddings...")
-        embeddings, cell_ids, times = emb_analyzer.extract_embeddings(eval_loader)
-        print(f"  Extracted {len(embeddings)} embeddings")
+        self.results['errors'] = errors
 
-        print("\nAnalyzing errors...")
-        error_analysis = emb_analyzer.categorize_errors(results)
-        print(f"  Total errors: {error_analysis['total_errors']}")
-        print(f"  Error breakdown:")
-        for k, v in error_analysis['percentages'].items():
-            print(f"    {k}: {v:.1f}%")
-
-        self.results['embedding_analysis'] = {
-            'n_embeddings': len(embeddings),
-            'error_analysis': error_analysis
-        }
-
-        # Generate Figure 7
-        self.fig_gen.figure7_embedding_analysis(embeddings, cell_ids, error_analysis)
+        print("\nGenerating Section 3.6 figures...")
+        self.fig_gen.fig_embedding_tsne(knn_results['test_embeddings'], knn_results['test_labels'])
+        self.fig_gen.fig_error_distribution(errors)
+        self.fig_gen.fig_confidence_histogram(knn_results)
 
         # =================================================================
-        # SAVE RESULTS
+        # SAVE
         # =================================================================
         print("\n" + "="*60)
         print("SAVING RESULTS")
         print("="*60)
 
-        results_path = os.path.join(self.config.OUTPUT_DIR, 'evaluation_results.pkl')
-        with open(results_path, 'wb') as f:
-            pickle.dump(self.results, f)
-        print(f"Results saved to: {results_path}")
+        # Save pickle (without large arrays for smaller file)
+        save_results = {k: v for k, v in self.results.items()}
+        if 'knn' in save_results:
+            save_results['knn'] = {k: v for k, v in save_results['knn'].items()
+                                   if k not in ['test_embeddings', 'predictions', 'confidences', 'test_labels']}
+        if 'matching' in save_results:
+            save_results['matching'] = {k: v for k, v in save_results['matching'].items()
+                                        if k != 'detailed_results'}
 
-        # Save text summary
-        summary_path = os.path.join(self.config.OUTPUT_DIR, 'evaluation_summary.txt')
-        with open(summary_path, 'w') as f:
-            f.write("TWIN ATTENTION MODEL EVALUATION SUMMARY\n")
+        with open(os.path.join(self.config.OUTPUT_DIR, 'evaluation_results.pkl'), 'wb') as f:
+            pickle.dump(save_results, f)
+
+        # Save summary
+        with open(os.path.join(self.config.OUTPUT_DIR, 'evaluation_summary.txt'), 'w') as f:
+            f.write("TWIN ATTENTION MODEL - EVALUATION SUMMARY\n")
             f.write("="*50 + "\n\n")
 
-            f.write("CORE PERFORMANCE\n")
-            f.write("-"*30 + "\n")
-            f.write(f"Overall accuracy: {metrics.get('overall_accuracy', 0)*100:.1f}%\n")
-            f.write(f"Match accuracy: {metrics.get('match_accuracy', 0)*100:.1f}%\n")
-            f.write(f"No-match accuracy: {metrics.get('nomatch_accuracy', 0)*100:.1f}%\n\n")
+            f.write("DIRECT MATCHING (Training Metrics):\n")
+            f.write(f"  Match Accuracy: {match_results['match_accuracy']*100:.1f}%\n")
+            f.write(f"  Outlier Accuracy: {match_results['outlier_accuracy']*100:.1f}%\n")
+            f.write(f"  Overall Accuracy: {match_results['overall_accuracy']*100:.1f}%\n\n")
 
-            f.write("BASELINE COMPARISON\n")
-            f.write("-"*30 + "\n")
-            for method, acc in baseline_results.items():
-                f.write(f"{method.upper()}: {acc*100:.1f}%\n")
-            f.write(f"Joint Attention (ours): {metrics.get('overall_accuracy', 0)*100:.1f}%\n\n")
+            f.write("KNN IDENTIFICATION:\n")
+            f.write(f"  Accuracy: {knn_results['overall_accuracy']*100:.1f}%\n")
+            f.write(f"  95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]\n\n")
 
-            f.write("ROBUSTNESS\n")
-            f.write("-"*30 + "\n")
-            f.write("Missing cells:\n")
-            for frac, acc in missing_results.items():
-                f.write(f"  {int(frac*100)}%: {acc*100:.1f}%\n")
-            f.write("Coordinate noise:\n")
-            for scale, acc in noise_results.items():
-                f.write(f"  {scale}x: {acc*100:.1f}%\n")
+            f.write("BASELINES:\n")
+            for m, a in baselines.items():
+                f.write(f"  {m.upper()}: {a*100:.1f}%\n")
+            f.write(f"  OURS: {match_results['match_accuracy']*100:.1f}%\n\n")
 
-        print(f"Summary saved to: {summary_path}")
+            f.write("ROBUSTNESS (Match Accuracy):\n")
+            f.write("  Missing cells:\n")
+            for frac, acc in robust_results['missing'].items():
+                f.write(f"    {int(frac*100)}%: {acc*100:.1f}%\n")
+            f.write("  Noise:\n")
+            for scale, acc in robust_results['noise'].items():
+                f.write(f"    {scale}x: {acc*100:.1f}%\n")
+
+        print(f"\nResults saved to: {self.config.OUTPUT_DIR}")
+        print(f"Figures saved to: {self.config.FIGURE_DIR}")
 
         print("\n" + "="*70)
         print("EVALUATION COMPLETE")
         print("="*70)
-        print(f"\nResults directory: {self.config.OUTPUT_DIR}")
-        print(f"Figures directory: {self.config.FIGURE_DIR}")
 
         return self.results
 
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
 def main():
-    """Main entry point for evaluation"""
-    # Create config with paths
-    config = EvalConfig()
-
-    # Allow command-line overrides
     import argparse
-    parser = argparse.ArgumentParser(description='Evaluate Twin Attention Model')
-    parser.add_argument('--train-data', type=str, help='Path to training data')
-    parser.add_argument('--eval-data', type=str, help='Path to evaluation data')
-    parser.add_argument('--model', type=str, help='Path to trained model')
-    parser.add_argument('--real-data', type=str, help='Path to real embryo data')
-    parser.add_argument('--output', type=str, default='evaluation_results', help='Output directory')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train-data', type=str)
+    parser.add_argument('--eval-data', type=str)
+    parser.add_argument('--model', type=str)
+    parser.add_argument('--output', type=str, default='evaluation_results')
     args = parser.parse_args()
 
+    config = EvalConfig()
     if args.train_data:
         config.TRAIN_DATA_PATH = args.train_data
     if args.eval_data:
         config.EVAL_DATA_PATH = args.eval_data
     if args.model:
         config.MODEL_PATH = args.model
-    if args.real_data:
-        config.REAL_EMBRYO_PATH = args.real_data
-    if args.output:
-        config.OUTPUT_DIR = args.output
-        config.FIGURE_DIR = os.path.join(args.output, 'figures')
+    config.OUTPUT_DIR = args.output
+    config.FIGURE_DIR = os.path.join(args.output, 'figures')
 
-    # Run evaluation
     runner = EvaluationRunner(config)
-    results = runner.run_full_evaluation()
-
-    return results
+    return runner.run()
 
 
 if __name__ == "__main__":
