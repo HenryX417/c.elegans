@@ -292,6 +292,14 @@ class MatchingEvaluator:
                         'confidence': torch.softmax(sims[b, i], dim=0).max().item()
                     })
 
+        # Compute accuracy by neighborhood size
+        size_results = {}
+        for name, (lo, hi) in [('sparse_5_10', (5, 10)), ('medium_11_15', (11, 15)), ('dense_16_20', (16, 20))]:
+            bin_results = [r for r in all_results if r['is_match'] and lo <= r['n_cells'] <= hi]
+            if bin_results:
+                bin_acc = sum(1 for r in bin_results if r['correct']) / len(bin_results)
+                size_results[name] = {'accuracy': bin_acc, 'count': len(bin_results)}
+
         results = {
             'loss': total_loss / batch_count if batch_count > 0 else 0,
             'match_accuracy': match_correct / match_total if match_total > 0 else 0,
@@ -301,6 +309,7 @@ class MatchingEvaluator:
             'outlier_correct': outlier_correct,
             'outlier_total': outlier_total,
             'overall_accuracy': (match_correct + outlier_correct) / (match_total + outlier_total) if (match_total + outlier_total) > 0 else 0,
+            'by_size': size_results,
             'detailed_results': all_results
         }
 
@@ -427,7 +436,7 @@ class KNNEvaluator:
         return np.array(embeddings), labels, metadata
 
     def evaluate(self, train_loader, test_loader):
-        """Full KNN evaluation with averaged embeddings"""
+        """Full KNN evaluation with averaged embeddings per unique cell"""
         print("\nBuilding KNN index from training data...")
         train_emb, train_labels, _ = self.extract_embeddings(train_loader, "Train embeddings")
         self.knn.fit(train_emb, train_labels)
@@ -443,16 +452,6 @@ class KNNEvaluator:
         # Compute metrics on UNIQUE cells (one vote per cell type)
         unique_correct = [1 if p == t else 0 for p, t in zip(unique_preds, unique_labels)]
         mean_acc, ci_low, ci_high = bootstrap_ci(unique_correct, self.config.N_BOOTSTRAP)
-
-        # By neighborhood size (use all samples for size breakdown)
-        size_results = {}
-        for name, (lo, hi) in [('sparse_5_10', (5, 10)), ('medium_11_15', (11, 15)), ('dense_16_20', (16, 20))]:
-            mask = [lo <= m['n_cells'] <= hi for m in test_meta]
-            if sum(mask) > 0:
-                bin_correct = [1 if predictions[i] == test_labels[i] else 0
-                              for i, m in enumerate(mask) if m]
-                acc = np.mean(bin_correct) if bin_correct else 0
-                size_results[name] = {'accuracy': acc, 'count': sum(mask)}
 
         # Hierarchical accuracy (on unique cells)
         hier = {'exact': 0, 'sublineage': 0, 'founder': 0, 'binary': 0}
@@ -476,7 +475,6 @@ class KNNEvaluator:
             'ci': (ci_low, ci_high),
             'total': len(test_labels),
             'unique_cells': n,
-            'by_size': size_results,
             'hierarchical': hier,
             'test_embeddings': test_emb,
             'test_labels': test_labels,
@@ -647,108 +645,149 @@ class RobustnessEvaluator:
 
 
 # =============================================================================
-# ABLATION STUDIES
+# ABLATION STUDIES - WITH ACTUAL TRAINING
 # =============================================================================
 class AblationEvaluator:
-    """Run ablation studies with modified architectures"""
+    """Run ablation studies by training variant models"""
 
     def __init__(self, config, train_data, eval_data):
         self.config = config
         self.train_data = train_data
         self.eval_data = eval_data
+        self.ablation_epochs = 15  # Quick training for ablations
+        self.ablation_samples = 2000  # Subset for faster training
 
-    def create_small_loader(self, data, n_samples=500):
-        """Create small dataloader for fast ablation testing"""
-        dataset = SparseEmbryoDataset(
-            data, stage_limit=self.config.STAGE_LIMIT,
+    def create_loaders(self, train_data, eval_data, n_train=2000, n_eval=500):
+        """Create train and eval dataloaders for ablation"""
+        train_ds = SparseEmbryoDataset(
+            train_data, stage_limit=self.config.STAGE_LIMIT,
+            min_cells=self.config.MIN_CELLS, max_cells=self.config.MAX_CELLS,
+            augment=True, num_rotations=3
+        )
+        if len(train_ds) > n_train:
+            indices = np.random.choice(len(train_ds), n_train, replace=False)
+            train_ds.pairs = [train_ds.pairs[i] for i in indices]
+
+        eval_ds = SparseEmbryoDataset(
+            eval_data, stage_limit=self.config.STAGE_LIMIT,
             min_cells=self.config.MIN_CELLS, max_cells=self.config.MAX_CELLS,
             augment=False, num_rotations=1
         )
-        # Limit to subset
-        if len(dataset) > n_samples:
-            indices = np.random.choice(len(dataset), n_samples, replace=False)
-            dataset.pairs = [dataset.pairs[i] for i in indices]
-        return DataLoader(dataset, batch_size=self.config.BATCH_SIZE,
-                         shuffle=False, collate_fn=collate_fn_with_padding, num_workers=0)
+        if len(eval_ds) > n_eval:
+            indices = np.random.choice(len(eval_ds), n_eval, replace=False)
+            eval_ds.pairs = [eval_ds.pairs[i] for i in indices]
 
-    def evaluate_config(self, model_config, loader, name):
-        """Evaluate a specific configuration"""
-        print(f"\n  Testing: {name}")
+        train_loader = DataLoader(train_ds, batch_size=self.config.BATCH_SIZE,
+                                  shuffle=True, collate_fn=collate_fn_with_padding, num_workers=0)
+        eval_loader = DataLoader(eval_ds, batch_size=self.config.BATCH_SIZE,
+                                 shuffle=False, collate_fn=collate_fn_with_padding, num_workers=0)
+        return train_loader, eval_loader
 
-        # Create model with config
+    def train_and_evaluate(self, model_config, train_loader, eval_loader, name):
+        """Train a model variant and evaluate it"""
+        print(f"\n  Training: {name}")
+
+        # Create model
+        use_uncertainty = model_config.get('use_uncertainty', True)
         model = EnhancedTwinAttentionEncoder(
             embed_dim=model_config.get('embed_dim', 128),
             num_heads=model_config.get('num_heads', 8),
             num_layers=model_config.get('num_layers', 6),
             dropout=0.1,
             use_sparse_features=model_config.get('use_sparse_features', True),
-            use_uncertainty=model_config.get('use_uncertainty', True),
+            use_uncertainty=use_uncertainty,
             use_learnable_no_match=model_config.get('use_learnable_no_match', True)
         ).to(device)
 
-        # For ablations, we use untrained model to show what each component contributes
-        # In practice you'd train each variant, but this shows architecture contribution
-        model.eval()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+        loss_fn = TwinAttentionMatchingLoss(use_uncertainty=use_uncertainty)
 
-        loss_fn = TwinAttentionMatchingLoss(use_uncertainty=model_config.get('use_uncertainty', True))
-        match_correct, match_total = 0, 0
-
-        with torch.no_grad():
-            for batch in loader:
+        # Training loop
+        best_acc = 0
+        for epoch in range(self.ablation_epochs):
+            model.train()
+            epoch_loss = 0
+            for batch in train_loader:
                 pc1, pc2, mask1, mask2, match_indices, _ = batch
-                pc1 = pc1.to(device)
-                pc2 = pc2.to(device)
-                mask1 = mask1.to(device)
-                mask2 = mask2.to(device)
+                pc1, pc2 = pc1.to(device), pc2.to(device)
+                mask1, mask2 = mask1.to(device), mask2.to(device)
                 match_indices = match_indices.to(device)
 
-                z1, z2, temp = model(pc1, pc2, mask1, mask2, epoch=100)
-                _, metrics = loss_fn(z1, z2, match_indices, temp, mask1, mask2)
+                optimizer.zero_grad()
+                z1, z2, temp = model(pc1, pc2, mask1, mask2, epoch=epoch)
+                loss, _ = loss_fn(z1, z2, match_indices, temp, mask1, mask2)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
 
-                match_correct += metrics['match_correct']
-                match_total += metrics['match_total']
+            # Quick validation every few epochs
+            if (epoch + 1) % 5 == 0 or epoch == self.ablation_epochs - 1:
+                model.eval()
+                match_correct, match_total = 0, 0
+                with torch.no_grad():
+                    for batch in eval_loader:
+                        pc1, pc2, mask1, mask2, match_indices, _ = batch
+                        pc1, pc2 = pc1.to(device), pc2.to(device)
+                        mask1, mask2 = mask1.to(device), mask2.to(device)
+                        match_indices = match_indices.to(device)
 
-        acc = match_correct / match_total if match_total > 0 else 0
-        print(f"    Accuracy: {acc*100:.1f}%")
-        return acc
+                        z1, z2, temp = model(pc1, pc2, mask1, mask2, epoch=100)
+                        _, metrics = loss_fn(z1, z2, match_indices, temp, mask1, mask2)
+                        match_correct += metrics['match_correct']
+                        match_total += metrics['match_total']
+
+                acc = match_correct / match_total if match_total > 0 else 0
+                best_acc = max(best_acc, acc)
+                print(f"    Epoch {epoch+1}/{self.ablation_epochs}: loss={epoch_loss/len(train_loader):.3f}, acc={acc*100:.1f}%")
+
+        print(f"    Final accuracy: {best_acc*100:.1f}%")
+        return best_acc
 
     def run_architecture_ablations(self):
         """Test different architecture configurations"""
-        print("\n--- Architecture Ablations ---")
-        loader = self.create_small_loader(self.eval_data, n_samples=300)
+        print("\n--- Architecture Ablations (Training each variant) ---")
+        train_loader, eval_loader = self.create_loaders(
+            self.train_data, self.eval_data,
+            n_train=self.ablation_samples, n_eval=500
+        )
 
         results = {}
 
+        # Architecture variants - vary one thing at a time
         configs = [
-            ('Full model (6 layers, 8 heads)', {'num_layers': 6, 'num_heads': 8}),
-            ('4 layers, 8 heads', {'num_layers': 4, 'num_heads': 8}),
-            ('2 layers, 8 heads', {'num_layers': 2, 'num_heads': 8}),
-            ('6 layers, 4 heads', {'num_layers': 6, 'num_heads': 4}),
-            ('6 layers, 2 heads', {'num_layers': 6, 'num_heads': 2}),
-            ('Smaller embedding (64)', {'num_layers': 6, 'num_heads': 8, 'embed_dim': 64}),
+            ('Full (6L, 8H, 128D)', {'num_layers': 6, 'num_heads': 8, 'embed_dim': 128}),
+            ('Shallow (2L)', {'num_layers': 2, 'num_heads': 8, 'embed_dim': 128}),
+            ('Medium (4L)', {'num_layers': 4, 'num_heads': 8, 'embed_dim': 128}),
+            ('Few heads (2H)', {'num_layers': 6, 'num_heads': 2, 'embed_dim': 128}),
+            ('Small embed (64D)', {'num_layers': 6, 'num_heads': 8, 'embed_dim': 64}),
         ]
 
         for name, cfg in configs:
-            results[name] = self.evaluate_config(cfg, loader, name)
+            results[name] = self.train_and_evaluate(cfg, train_loader, eval_loader, name)
 
         return results
 
     def run_feature_ablations(self):
         """Test contribution of different features"""
-        print("\n--- Feature Ablations ---")
-        loader = self.create_small_loader(self.eval_data, n_samples=300)
+        print("\n--- Feature Ablations (Training each variant) ---")
+        train_loader, eval_loader = self.create_loaders(
+            self.train_data, self.eval_data,
+            n_train=self.ablation_samples, n_eval=500
+        )
 
         results = {}
 
+        # Feature variants
         configs = [
-            ('Full features', {'use_sparse_features': True, 'use_uncertainty': True, 'use_learnable_no_match': True}),
+            ('All features', {'use_sparse_features': True, 'use_uncertainty': True, 'use_learnable_no_match': True}),
             ('No sparse features', {'use_sparse_features': False, 'use_uncertainty': True, 'use_learnable_no_match': True}),
             ('No uncertainty', {'use_sparse_features': True, 'use_uncertainty': False, 'use_learnable_no_match': True}),
-            ('No learnable no-match', {'use_sparse_features': True, 'use_uncertainty': True, 'use_learnable_no_match': False}),
+            ('No no-match token', {'use_sparse_features': True, 'use_uncertainty': True, 'use_learnable_no_match': False}),
         ]
 
         for name, cfg in configs:
-            results[name] = self.evaluate_config(cfg, loader, name)
+            results[name] = self.train_and_evaluate(cfg, train_loader, eval_loader, name)
 
         return results
 
@@ -1200,6 +1239,11 @@ class EvaluationRunner:
 
         self.results['matching'] = match_results
 
+        # Print by_size from matching results
+        print(f"\n  By neighborhood size (direct matching):")
+        for k, v in match_results['by_size'].items():
+            print(f"    {k}: {v['accuracy']*100:.1f}% (n={v['count']})")
+
         # KNN Identification
         print("\n--- KNN Cell Identification ---")
         knn_eval = KNNEvaluator(model, self.config)
@@ -1207,10 +1251,7 @@ class EvaluationRunner:
 
         print(f"\n  KNN Accuracy: {knn_results['overall_accuracy']*100:.1f}% (on {knn_results['unique_cells']} unique cells)")
         print(f"    95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]")
-        print(f"\n  By neighborhood size:")
-        for k, v in knn_results['by_size'].items():
-            print(f"    {k}: {v['accuracy']*100:.1f}% (n={v['count']})")
-        print(f"\n  Hierarchical accuracy:")
+        print(f"\n  Hierarchical accuracy (KNN):")
         for k, v in knn_results['hierarchical'].items():
             print(f"    {k}: {v*100:.1f}%")
 
@@ -1220,7 +1261,7 @@ class EvaluationRunner:
         print("\nGenerating Section 3.1 figures...")
         self.fig_gen.fig_matching_accuracy(match_results)
         self.fig_gen.fig_knn_accuracy(knn_results)
-        self.fig_gen.fig_accuracy_by_size(knn_results)
+        self.fig_gen.fig_accuracy_by_size(match_results)  # Use matching results
         self.fig_gen.fig_hierarchical(knn_results)
 
         # =================================================================
