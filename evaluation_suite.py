@@ -519,21 +519,24 @@ class BaselineEvaluator:
         self.config = config
         self.reference_db = {}  # cell_id -> list of neighborhoods
 
-    def build_reference_database(self, train_data, max_refs_per_cell=10):
+    def build_reference_database(self, train_data, max_refs_per_cell=3):
         """Build reference database of neighborhoods for each cell identity"""
         print("  Building reference database for baseline identification...")
         self.reference_db = defaultdict(list)
 
         for embryo, timepoints in train_data.items():
             for t, cells in timepoints.items():
-                if int(t) > self.config.STAGE_LIMIT:
-                    continue
-
                 cell_ids = list(cells.keys())
-                if len(cell_ids) < self.config.MIN_CELLS:
+                n_cells = len(cell_ids)
+
+                if n_cells > self.config.STAGE_LIMIT or n_cells < self.config.MIN_CELLS:
                     continue
 
-                positions = np.array([cells[c]['position'] for c in cell_ids])
+                # cells[cell_id] returns position directly as [x,y,z]
+                positions = np.array([cells[c] for c in cell_ids])
+
+                # Normalize coordinates
+                positions = (positions - positions.mean(0)) / (positions.std() + 1e-6)
 
                 # Extract neighborhood for each cell
                 for i, cell_id in enumerate(cell_ids):
@@ -541,13 +544,12 @@ class BaselineEvaluator:
                         continue
 
                     # Get local neighborhood (positions relative to center cell)
-                    center = positions[i]
-                    neighborhood = positions - center  # Center on this cell
+                    neighborhood = positions - positions[i]
 
                     self.reference_db[cell_id].append({
                         'neighborhood': neighborhood,
                         'center_idx': i,
-                        'n_cells': len(cell_ids)
+                        'n_cells': n_cells
                     })
 
         print(f"    Built database with {len(self.reference_db)} cell types, "
@@ -682,7 +684,7 @@ class BaselineEvaluator:
             vote_counts = Counter(top_k)
             return vote_counts.most_common(1)[0][0] if vote_counts else None
 
-    def evaluate(self, test_data, method, n_samples=500):
+    def evaluate(self, test_data, method, n_samples=200):
         """
         Evaluate baseline on cell IDENTIFICATION task.
         For each test cell, identify it by comparing against reference database.
@@ -698,12 +700,15 @@ class BaselineEvaluator:
         test_samples = []
         for embryo, timepoints in test_data.items():
             for t, cells in timepoints.items():
-                if int(t) > self.config.STAGE_LIMIT:
-                    continue
                 cell_ids = list(cells.keys())
-                if len(cell_ids) < self.config.MIN_CELLS:
+                n_cells = len(cell_ids)
+
+                if n_cells > self.config.STAGE_LIMIT or n_cells < self.config.MIN_CELLS:
                     continue
-                positions = np.array([cells[c]['position'] for c in cell_ids])
+
+                # cells[cell_id] returns position directly
+                positions = np.array([cells[c] for c in cell_ids])
+                positions = (positions - positions.mean(0)) / (positions.std() + 1e-6)
 
                 for i, cell_id in enumerate(cell_ids):
                     if cell_id not in self.reference_db:
@@ -875,7 +880,7 @@ class SiameseBaselineEvaluator:
         self.config = config
         self.train_data = train_data
         self.eval_data = eval_data
-        self.train_epochs = 20
+        self.train_epochs = 12  # Reduced for CPU
 
     @torch.no_grad()
     def extract_embeddings(self, model, dataloader, desc="Extracting"):
@@ -1089,8 +1094,8 @@ class AblationEvaluator:
         self.config = config
         self.train_data = train_data
         self.eval_data = eval_data
-        self.ablation_epochs = 15  # Quick training for ablations
-        self.ablation_samples = 2000  # Subset for faster training
+        self.ablation_epochs = 10  # Quick training for ablations
+        self.ablation_samples = 1500  # Subset for faster training
 
     def create_loaders(self, train_data, eval_data, n_train=2000, n_eval=500, use_curriculum=True):
         """Create train and eval dataloaders for ablation"""
@@ -1219,19 +1224,17 @@ class AblationEvaluator:
         print("\n--- Architecture Ablations (Model Size Comparison) ---")
         train_loader, eval_loader, train_ds = self.create_loaders(
             self.train_data, self.eval_data,
-            n_train=self.ablation_samples, n_eval=500
+            n_train=self.ablation_samples, n_eval=400
         )
 
         results = {}
 
-        # Architecture variants - testing model depth and size
+        # Key architecture variants - reduced for CPU
         configs = [
             ('Full (6L, 8H, 128D)', {'num_layers': 6, 'num_heads': 8, 'embed_dim': 128}),
             ('Shallow (2L)', {'num_layers': 2, 'num_heads': 8, 'embed_dim': 128}),
-            ('Medium (4L)', {'num_layers': 4, 'num_heads': 8, 'embed_dim': 128}),
-            ('Few heads (4H)', {'num_layers': 6, 'num_heads': 4, 'embed_dim': 128}),
             ('Small embed (64D)', {'num_layers': 6, 'num_heads': 8, 'embed_dim': 64}),
-            ('Tiny model (2L, 4H, 64D)', {'num_layers': 2, 'num_heads': 4, 'embed_dim': 64}),
+            ('Tiny (2L, 4H, 64D)', {'num_layers': 2, 'num_heads': 4, 'embed_dim': 64}),
         ]
 
         for name, cfg in configs:
