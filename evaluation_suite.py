@@ -48,7 +48,7 @@ class EvalConfig:
     TRAIN_DATA_PATH = r"C:\Users\henry\OneDrive\Documents\Research Folder\Data\data_dict.pkl"
     EVAL_DATA_PATH = r"C:\Users\henry\OneDrive\Documents\Research Folder\Data\evaluation_data_dict.pkl"
     MODEL_PATH = r"C:\Users\henry\OneDrive\Documents\Research Folder\Data\twin_attention_final.pth"
-    REAL_EMBRYO_PATH = None
+    REAL_EMBRYO_PATH = r"C:\Users\henry\OneDrive\Documents\Research Folder\Data\real_data_dict.pkl"
 
     OUTPUT_DIR = "evaluation_results"
     FIGURE_DIR = "evaluation_figures"
@@ -490,60 +490,89 @@ class KNNEvaluator:
 # =============================================================================
 class BaselineEvaluator:
     """
-    Baseline methods evaluated under realistic conditions:
-    - Random rotations applied to simulate different embryo orientations
-    - No helpful pre-alignment that wouldn't be available in practice
-    - Proper handling of no-match cases (baselines fail on these)
+    Baseline methods for CELL IDENTIFICATION task (not matching).
+
+    The task: Given a cell's neighborhood from a new embryo, identify which cell it is
+    by comparing against a reference database of known cell neighborhoods.
+
+    Traditional methods (ICP, CPD, Hungarian) don't produce embeddings, so we use
+    alignment quality (RMSE after alignment) as similarity measure and do
+    exhaustive comparison against reference neighborhoods.
 
     Paper claims: ICP ~45%, CPD ~52%, Hungarian ~52%
     """
     def __init__(self, config):
         self.config = config
+        self.reference_db = {}  # cell_id -> list of neighborhoods
 
-    def _apply_random_rotation(self, pc):
-        """Apply random rotation to simulate different embryo orientations"""
-        # Generate random rotation matrix
-        angles = np.random.uniform(0, 2*np.pi, 3)
-        Rx = np.array([[1, 0, 0],
-                       [0, np.cos(angles[0]), -np.sin(angles[0])],
-                       [0, np.sin(angles[0]), np.cos(angles[0])]])
-        Ry = np.array([[np.cos(angles[1]), 0, np.sin(angles[1])],
-                       [0, 1, 0],
-                       [-np.sin(angles[1]), 0, np.cos(angles[1])]])
-        Rz = np.array([[np.cos(angles[2]), -np.sin(angles[2]), 0],
-                       [np.sin(angles[2]), np.cos(angles[2]), 0],
-                       [0, 0, 1]])
-        R_mat = Rz @ Ry @ Rx
-        return (pc - pc.mean(0)) @ R_mat.T
+    def build_reference_database(self, train_data, max_refs_per_cell=10):
+        """Build reference database of neighborhoods for each cell identity"""
+        print("  Building reference database for baseline identification...")
+        self.reference_db = defaultdict(list)
 
-    def icp(self, pc1, pc2, iters=30):
-        """
-        ICP baseline - struggles with partial observations because:
-        1. No global landmarks for alignment
-        2. Many cells don't have correspondences
-        3. Converges to local minima with sparse points
-        """
-        # Apply different random rotations to each (simulating real conditions)
-        src = self._apply_random_rotation(pc1.copy())
-        tgt = self._apply_random_rotation(pc2.copy())
+        for embryo, timepoints in train_data.items():
+            for t, cells in timepoints.items():
+                if int(t) > self.config.STAGE_LIMIT:
+                    continue
 
-        # ICP iterations
+                cell_ids = list(cells.keys())
+                if len(cell_ids) < self.config.MIN_CELLS:
+                    continue
+
+                positions = np.array([cells[c]['position'] for c in cell_ids])
+
+                # Extract neighborhood for each cell
+                for i, cell_id in enumerate(cell_ids):
+                    if len(self.reference_db[cell_id]) >= max_refs_per_cell:
+                        continue
+
+                    # Get local neighborhood (positions relative to center cell)
+                    center = positions[i]
+                    neighborhood = positions - center  # Center on this cell
+
+                    self.reference_db[cell_id].append({
+                        'neighborhood': neighborhood,
+                        'center_idx': i,
+                        'n_cells': len(cell_ids)
+                    })
+
+        print(f"    Built database with {len(self.reference_db)} cell types, "
+              f"{sum(len(v) for v in self.reference_db.values())} total references")
+
+    def _compute_alignment_error(self, query, reference, method='icp'):
+        """Compute alignment error between query and reference neighborhoods"""
+        # Center both
+        q = query - query.mean(0)
+        r = reference - reference.mean(0)
+
+        if method == 'icp':
+            return self._icp_error(q, r)
+        elif method == 'cpd':
+            return self._cpd_error(q, r)
+        elif method == 'hungarian':
+            return self._hungarian_error(q, r)
+        return float('inf')
+
+    def _icp_error(self, src, tgt, iters=20):
+        """ICP alignment and return RMSE"""
+        src = src.copy()
+
         for _ in range(iters):
             nn = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(tgt)
             dists, idx = nn.kneighbors(src)
 
-            # Reject outliers based on distance (ICP robustification)
+            # Reject outliers
             median_dist = np.median(dists)
             inlier_mask = dists.flatten() < median_dist * 3
 
             if inlier_mask.sum() < 4:
                 break
 
-            src_inliers = src[inlier_mask]
-            tgt_inliers = tgt[idx.flatten()[inlier_mask]]
+            src_in = src[inlier_mask]
+            tgt_in = tgt[idx.flatten()[inlier_mask]]
 
-            # Compute transformation
-            H = src_inliers.T @ tgt_inliers
+            # Compute rotation
+            H = src_in.T @ tgt_in
             U, _, Vt = np.linalg.svd(H)
             R_mat = Vt.T @ U.T
             if np.linalg.det(R_mat) < 0:
@@ -551,81 +580,50 @@ class BaselineEvaluator:
                 R_mat = Vt.T @ U.T
             src = src @ R_mat.T
 
-        # Final matching
+        # Final RMSE
         nn = NearestNeighbors(n_neighbors=1).fit(tgt)
-        _, idx = nn.kneighbors(src)
-        return idx.flatten()
+        dists, _ = nn.kneighbors(src)
+        return np.sqrt(np.mean(dists**2))
 
-    def cpd(self, pc1, pc2, w=0.5, max_iter=50):
-        """
-        Coherent Point Drift baseline - probabilistic registration
-        Struggles with partial observations due to:
-        1. Assumes global coherent structure
-        2. Cannot handle missing correspondences well
-        """
-        # Apply random rotations
-        X = self._apply_random_rotation(pc1.copy())
-        Y = self._apply_random_rotation(pc2.copy())
-
+    def _cpd_error(self, X, Y, w=0.5, max_iter=30):
+        """CPD alignment and return final RMSE"""
         N, D = X.shape
         M = Y.shape[0]
 
-        # Initialize
-        sigma2 = np.sum((X[None, :, :] - Y[:, None, :]) ** 2) / (D * N * M)
+        if N == 0 or M == 0:
+            return float('inf')
+
+        sigma2 = np.sum((X[None, :, :] - Y[:, None, :]) ** 2) / (D * N * M + 1e-10)
         T = Y.copy()
 
-        for iteration in range(max_iter):
-            # E-step: compute P
-            P = np.zeros((M, N))
-            for m in range(M):
-                for n in range(N):
-                    P[m, n] = np.exp(-np.sum((X[n] - T[m]) ** 2) / (2 * sigma2))
-
-            # Normalize
-            c = (2 * np.pi * sigma2) ** (D / 2) * w / (1 - w) * M / N
-            P = P / (P.sum(axis=0, keepdims=True) + c + 1e-10)
-
-            # M-step
-            P1 = P.sum(axis=1)
-            Pt1 = P.sum(axis=0)
-            Np = P1.sum()
-
-            if Np < 1e-10:
-                break
-
-            # Update T (simplified - just use weighted mean)
-            muX = X.T @ Pt1 / Np
-            muY = T.T @ P1 / Np
+        for _ in range(max_iter):
+            # Simplified E-step
+            dists = np.sum((X[None, :, :] - T[:, None, :]) ** 2, axis=2)
+            P = np.exp(-dists / (2 * sigma2 + 1e-10))
+            P = P / (P.sum(axis=0, keepdims=True) + 1e-10)
 
             # Update sigma2
-            sigma2_new = 0
-            for n in range(N):
-                for m in range(M):
-                    sigma2_new += P[m, n] * np.sum((X[n] - T[m]) ** 2)
-            sigma2 = sigma2_new / (Np * D) + 1e-10
+            Np = P.sum()
+            if Np < 1e-10:
+                break
+            sigma2 = np.sum(P * dists) / (Np * D + 1e-10)
 
-        # Final matching via nearest neighbor
+        # Final RMSE
         nn = NearestNeighbors(n_neighbors=1).fit(T)
-        _, idx = nn.kneighbors(X)
-        return idx.flatten()
+        dists, _ = nn.kneighbors(X)
+        return np.sqrt(np.mean(dists**2))
 
-    def hungarian(self, pc1, pc2):
-        """
-        Hungarian assignment baseline - optimal assignment on distance matrix
-        Struggles because:
-        1. Uses Euclidean distance which isn't rotation invariant
-        2. Cannot handle outliers (no-match cases)
-        """
+    def _hungarian_error(self, src, tgt):
+        """Hungarian assignment error"""
         from scipy.spatial.distance import cdist
 
-        # Apply random rotations to simulate real conditions
-        src = self._apply_random_rotation(pc1.copy())
-        tgt = self._apply_random_rotation(pc2.copy())
-
         cost = cdist(src, tgt)
-        n1, n2 = len(pc1), len(pc2)
+        n1, n2 = len(src), len(tgt)
 
-        # Pad cost matrix if sizes differ
+        if n1 == 0 or n2 == 0:
+            return float('inf')
+
+        # Pad if needed
         if n1 != n2:
             max_size = max(n1, n2)
             pad = np.full((max_size, max_size), cost.max() * 10)
@@ -634,59 +632,101 @@ class BaselineEvaluator:
 
         row, col = linear_sum_assignment(cost)
 
-        # Map back - cells without valid match get n2
-        result = np.full(n1, n2, dtype=int)
+        # Compute assignment error
+        total_error = 0
+        count = 0
         for r, c in zip(row, col):
             if r < n1 and c < n2:
-                result[r] = c
-        return result
+                total_error += cdist(src[r:r+1], tgt[c:c+1])[0, 0] ** 2
+                count += 1
 
-    def evaluate(self, dataloader, method):
+        return np.sqrt(total_error / (count + 1e-10))
+
+    def identify_cell(self, query_neighborhood, method='icp', k=5):
+        """Identify a cell by comparing against all reference neighborhoods"""
+        scores = []  # (cell_id, error)
+
+        for cell_id, refs in self.reference_db.items():
+            # Compare against each reference for this cell
+            min_error = float('inf')
+            for ref in refs[:3]:  # Limit comparisons for speed
+                error = self._compute_alignment_error(
+                    query_neighborhood, ref['neighborhood'], method
+                )
+                min_error = min(min_error, error)
+            scores.append((cell_id, min_error))
+
+        # Sort by error (lower is better)
+        scores.sort(key=lambda x: x[1])
+
+        # Return best match (or k-voting)
+        if k == 1:
+            return scores[0][0] if scores else None
+        else:
+            # Majority vote among top-k
+            top_k = [s[0] for s in scores[:k]]
+            vote_counts = Counter(top_k)
+            return vote_counts.most_common(1)[0][0] if vote_counts else None
+
+    def evaluate(self, test_data, method, n_samples=500):
         """
-        Evaluate baseline on all cases including no-match.
-        Baselines cannot detect no-match cases, so they fail on those.
+        Evaluate baseline on cell IDENTIFICATION task.
+        For each test cell, identify it by comparing against reference database.
         """
-        correct, total = 0, 0
-        match_correct, match_total = 0, 0
-        outlier_total = 0
+        if not self.reference_db:
+            raise ValueError("Must call build_reference_database first")
 
-        for batch in tqdm(dataloader, desc=f"Baseline: {method}"):
-            pc1, pc2, mask1, mask2, match_indices, _ = batch
-            B = pc1.shape[0]
+        correct = 0
+        total = 0
+        hier = {'exact': 0, 'sublineage': 0, 'founder': 0, 'binary': 0}
 
-            for b in range(B):
-                n1 = int(mask1[b].sum().item())
-                n2 = int(mask2[b].sum().item())
-                p1 = pc1[b, :n1].numpy()
-                p2 = pc2[b, :n2].numpy()
+        # Collect test samples
+        test_samples = []
+        for embryo, timepoints in test_data.items():
+            for t, cells in timepoints.items():
+                if int(t) > self.config.STAGE_LIMIT:
+                    continue
+                cell_ids = list(cells.keys())
+                if len(cell_ids) < self.config.MIN_CELLS:
+                    continue
+                positions = np.array([cells[c]['position'] for c in cell_ids])
 
-                if method == 'icp':
-                    preds = self.icp(p1, p2)
-                elif method == 'cpd':
-                    preds = self.cpd(p1, p2)
-                elif method == 'hungarian':
-                    preds = self.hungarian(p1, p2)
+                for i, cell_id in enumerate(cell_ids):
+                    if cell_id not in self.reference_db:
+                        continue  # Skip cells not in training
+                    neighborhood = positions - positions[i]  # Center on this cell
+                    test_samples.append((cell_id, neighborhood))
 
-                for i in range(n1):
-                    tgt = match_indices[b, i].item()
-                    total += 1
+        # Subsample for speed (baseline comparison is expensive)
+        if len(test_samples) > n_samples:
+            test_samples = random.sample(test_samples, n_samples)
 
-                    if tgt < n2:  # Valid match case
-                        match_total += 1
-                        if i < len(preds) and preds[i] == tgt:
-                            correct += 1
-                            match_correct += 1
-                    else:  # No-match case - baselines always fail these
-                        outlier_total += 1
-                        # Baselines can't detect no-match, so they're wrong
-                        # (they always assign to something)
+        print(f"    Evaluating {len(test_samples)} test cells with {method}...")
 
-        # Report match accuracy only (fair comparison - overall would be lower)
-        match_acc = match_correct / match_total if match_total > 0 else 0
-        overall_acc = correct / total if total > 0 else 0
+        for true_id, neighborhood in tqdm(test_samples, desc=f"Baseline {method}"):
+            pred_id = self.identify_cell(neighborhood, method=method, k=1)
+            total += 1
 
-        print(f"    Match-only: {match_acc*100:.1f}%, Overall: {overall_acc*100:.1f}% (outliers: {outlier_total})")
-        return match_acc  # Report match accuracy for fair comparison
+            if pred_id == true_id:
+                correct += 1
+                hier['exact'] += 1
+            if same_sublineage(pred_id, true_id):
+                hier['sublineage'] += 1
+            if same_founder(pred_id, true_id):
+                hier['founder'] += 1
+            true_ab = get_founder(true_id) == 'AB'
+            pred_ab = get_founder(pred_id) == 'AB' if pred_id else False
+            if true_ab == pred_ab:
+                hier['binary'] += 1
+
+        accuracy = correct / total if total > 0 else 0
+        hier = {k: v / total for k, v in hier.items()} if total > 0 else hier
+
+        print(f"    {method.upper()} Identification Accuracy: {accuracy*100:.1f}%")
+        print(f"      Hierarchical: exact={hier['exact']*100:.1f}%, "
+              f"sublineage={hier['sublineage']*100:.1f}%, founder={hier['founder']*100:.1f}%")
+
+        return accuracy, hier
 
 
 # =============================================================================
