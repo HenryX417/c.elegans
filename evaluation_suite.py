@@ -984,12 +984,12 @@ class SiameseBaselineEvaluator:
             test_emb, test_labels, batch_size=self.config.KNN_BATCH_SIZE
         )
 
-        # Compute accuracy on unique cells
+        # Compute accuracy on unique cells with bootstrap CI
         unique_correct = [1 if p == t else 0 for p, t in zip(unique_preds, unique_labels)]
-        accuracy = np.mean(unique_correct)
+        accuracy, ci_low, ci_high = bootstrap_ci(unique_correct, n=50)
 
-        print(f"  Siamese KNN Identification Accuracy: {accuracy*100:.1f}% ({len(unique_labels)} unique cells)")
-        return accuracy
+        print(f"  Siamese KNN Identification Accuracy: {accuracy*100:.1f}% [CI: {ci_low*100:.1f}-{ci_high*100:.1f}%] ({len(unique_labels)} unique cells)")
+        return {'acc': accuracy, 'ci': (ci_low, ci_high)}
 
 
 # =============================================================================
@@ -1004,7 +1004,7 @@ class RobustnessEvaluator:
     @torch.no_grad()
     def evaluate_perturbed(self, dataloader, perturb_fn, desc=""):
         self.model.eval()
-        match_correct, match_total = 0, 0
+        batch_accs = []
 
         for batch in tqdm(dataloader, desc=desc):
             pc1, pc2, mask1, mask2, match_indices, _ = batch
@@ -1019,10 +1019,14 @@ class RobustnessEvaluator:
             z1, z2, temp = self.model(pc1, pc2, mask1, mask2, epoch=100)
             _, metrics = self.loss_fn(z1, z2, match_indices, temp, mask1, mask2)
 
-            match_correct += metrics['match_correct']
-            match_total += metrics['match_total']
+            if metrics['match_total'] > 0:
+                batch_accs.append(metrics['match_correct'] / metrics['match_total'])
 
-        return match_correct / match_total if match_total > 0 else 0
+        # Compute mean and CI
+        if batch_accs:
+            mean_acc, ci_low, ci_high = bootstrap_ci(batch_accs, n=50)
+            return {'acc': mean_acc, 'ci': (ci_low, ci_high)}
+        return {'acc': 0, 'ci': (0, 0)}
 
     def missing_cells(self, frac):
         def fn(pc1, pc2, m1, m2):
@@ -1057,20 +1061,28 @@ class RobustnessEvaluator:
         return lambda p1, p2, m1, m2: (p1, p2, m1, m2)
 
     def run_sweeps(self, dataloader):
-        """Run missing cells and noise sweeps"""
+        """Run missing cells and noise sweeps with CI"""
         missing = {}
         for frac in [0.0, 0.1, 0.2, 0.3, 0.4]:
             fn = self.no_perturb() if frac == 0 else self.missing_cells(frac)
-            acc = self.evaluate_perturbed(dataloader, fn, f"Missing {int(frac*100)}%")
-            missing[frac] = acc
-            print(f"  {int(frac*100)}% missing: {acc*100:.1f}%")
+            result = self.evaluate_perturbed(dataloader, fn, f"Missing {int(frac*100)}%")
+            missing[frac] = result
+            acc = result['acc'] if isinstance(result, dict) else result
+            if isinstance(result, dict) and 'ci' in result:
+                print(f"  {int(frac*100)}% missing: {acc*100:.1f}% [CI: {result['ci'][0]*100:.1f}-{result['ci'][1]*100:.1f}%]")
+            else:
+                print(f"  {int(frac*100)}% missing: {acc*100:.1f}%")
 
         noise = {}
         for scale in [0.0, 0.1, 0.2, 0.3, 0.5]:
             fn = self.no_perturb() if scale == 0 else self.coord_noise(scale)
-            acc = self.evaluate_perturbed(dataloader, fn, f"Noise {scale}x")
-            noise[scale] = acc
-            print(f"  {scale}x noise: {acc*100:.1f}%")
+            result = self.evaluate_perturbed(dataloader, fn, f"Noise {scale}x")
+            noise[scale] = result
+            acc = result['acc'] if isinstance(result, dict) else result
+            if isinstance(result, dict) and 'ci' in result:
+                print(f"  {scale}x noise: {acc*100:.1f}% [CI: {result['ci'][0]*100:.1f}-{result['ci'][1]*100:.1f}%]")
+            else:
+                print(f"  {scale}x noise: {acc*100:.1f}%")
 
         return {'missing': missing, 'noise': noise}
 
@@ -1150,7 +1162,7 @@ class AblationEvaluator:
         return np.array(embeddings), labels
 
     def train_and_evaluate(self, model_config, train_loader, eval_loader, name, train_ds=None, use_curriculum=True):
-        """Train a model variant and evaluate with KNN identification"""
+        """Train a model variant and evaluate with KNN identification + bootstrap CI"""
         print(f"\n  Training: {name}")
 
         # Create model
@@ -1174,10 +1186,7 @@ class AblationEvaluator:
         # Curriculum schedule (if enabled)
         curriculum_schedule = {0: 0, 3: 1, 6: 2, 9: 3} if use_curriculum else {}
 
-        # Track training progress
-        epoch_history = []
-
-        # Training loop with epoch-by-epoch tracking
+        # Training loop
         for epoch in range(self.ablation_epochs):
             if train_ds is not None and use_curriculum:
                 for epoch_threshold, stage in curriculum_schedule.items():
@@ -1200,30 +1209,11 @@ class AblationEvaluator:
                 optimizer.step()
                 epoch_loss += loss.item()
 
-            avg_loss = epoch_loss / len(train_loader)
+            if (epoch + 1) % 5 == 0 or epoch == self.ablation_epochs - 1:
+                print(f"    Epoch {epoch+1}/{self.ablation_epochs}: loss={epoch_loss/len(train_loader):.3f}")
 
-            # Evaluate matching accuracy every epoch (fast)
-            model.eval()
-            match_correct, match_total = 0, 0
-            with torch.no_grad():
-                for batch in eval_loader:
-                    pc1, pc2, mask1, mask2, match_indices, _ = batch
-                    pc1, pc2 = pc1.to(device), pc2.to(device)
-                    mask1, mask2 = mask1.to(device), mask2.to(device)
-                    match_indices = match_indices.to(device)
-
-                    z1, z2, temp = model(pc1, pc2, mask1, mask2, epoch=100)
-                    _, metrics = loss_fn(z1, z2, match_indices, temp, mask1, mask2)
-                    match_correct += metrics['match_correct']
-                    match_total += metrics['match_total']
-
-            match_acc = match_correct / match_total if match_total > 0 else 0
-            epoch_history.append({'epoch': epoch+1, 'loss': avg_loss, 'match_acc': match_acc})
-
-            print(f"    Epoch {epoch+1}/{self.ablation_epochs}: loss={avg_loss:.3f}, match_acc={match_acc*100:.1f}%")
-
-        # Final KNN Identification evaluation
-        print(f"    Final KNN evaluation...")
+        # Final KNN Identification evaluation with bootstrap CI
+        print(f"    Evaluating...")
         train_emb, train_labels = self.extract_embeddings(model, train_loader)
         test_emb, test_labels = self.extract_embeddings(model, eval_loader)
 
@@ -1234,15 +1224,13 @@ class AblationEvaluator:
             test_emb, test_labels, batch_size=self.config.KNN_BATCH_SIZE
         )
 
-        # Accuracy on unique cells
+        # Accuracy with bootstrap CI
         unique_correct = [1 if p == t else 0 for p, t in zip(unique_preds, unique_labels)]
-        accuracy = np.mean(unique_correct)
+        accuracy, ci_low, ci_high = bootstrap_ci(unique_correct, n_bootstrap=50)
 
-        print(f"    KNN Identification Accuracy: {accuracy*100:.1f}%")
-        curve_str = " -> ".join([f"{h['match_acc']*100:.0f}%" for h in epoch_history])
-        print(f"    Training curve: {curve_str}")
+        print(f"    KNN Accuracy: {accuracy*100:.1f}% [95% CI: {ci_low*100:.1f}%-{ci_high*100:.1f}%]")
 
-        return accuracy
+        return {'acc': accuracy, 'ci': (ci_low, ci_high)}
 
     def run_architecture_ablations(self):
         """Test different architecture configurations (model depth/size)"""
@@ -1269,12 +1257,14 @@ class AblationEvaluator:
 
     def run_feature_ablations(self):
         """
-        Test contribution of different features.
+        Test contribution of different features - COMPREHENSIVE.
 
         Key ablations from paper:
-        - No sparse features (raw XYZ): ~68% (huge drop)
-        - No no-match token: ~81.5% (-11.8pp)
+        - All features (full model): ~93%
+        - No sparse features (raw XYZ): ~68% (huge drop, proves sparse features critical)
+        - No no-match token: ~81.5% (-11.8pp, proves no-match essential)
         - No uncertainty: minor impact
+        - Minimal (no sparse + no uncertainty): baseline performance
         """
         print("\n--- Feature Ablations (Training each variant) ---")
         train_loader, eval_loader, train_ds = self.create_loaders(
@@ -1284,27 +1274,35 @@ class AblationEvaluator:
 
         results = {}
 
-        # Feature variants - testing each component's contribution
+        # Comprehensive feature ablation - systematic removal
         configs = [
-            ('All features', {
+            # Full model
+            ('Full model (all features)', {
                 'use_sparse_features': True,
                 'use_uncertainty': True,
                 'use_learnable_no_match': True
             }),
-            ('No sparse features (raw XYZ only)', {
+            # Remove one feature at a time to prove significance
+            ('- sparse features (raw XYZ)', {
                 'use_sparse_features': False,
                 'use_uncertainty': True,
                 'use_learnable_no_match': True
             }),
-            ('No no-match token', {
+            ('- no-match token', {
                 'use_sparse_features': True,
                 'use_uncertainty': True,
                 'use_learnable_no_match': False
             }),
-            ('No uncertainty', {
+            ('- uncertainty estimation', {
                 'use_sparse_features': True,
                 'use_uncertainty': False,
                 'use_learnable_no_match': True
+            }),
+            # Minimal baseline - all features removed
+            ('Minimal (raw XYZ only)', {
+                'use_sparse_features': False,
+                'use_uncertainty': False,
+                'use_learnable_no_match': False
             }),
         ]
 
@@ -1340,7 +1338,10 @@ class AblationEvaluator:
             train_ds=None, use_curriculum=False
         )
 
-        diff = (results['With curriculum'] - results['Without curriculum']) * 100
+        # Handle dict format for diff calculation
+        with_acc = results['With curriculum']['acc'] if isinstance(results['With curriculum'], dict) else results['With curriculum']
+        without_acc = results['Without curriculum']['acc'] if isinstance(results['Without curriculum'], dict) else results['Without curriculum']
+        diff = (with_acc - without_acc) * 100
         print(f"\n  Curriculum learning contribution: +{diff:.1f}pp")
 
         return results
@@ -1544,24 +1545,51 @@ class FigureGenerator:
 
         self.save(fig, name)
 
-    def fig_baseline_comparison(self, baselines, our_acc, siamese_acc=None, name="fig_baseline_comparison.png"):
-        """Baseline method comparison - shows our method is better"""
+    def fig_baseline_comparison(self, baselines, our_result, siamese_result=None, name="fig_baseline_comparison.png"):
+        """Baseline method comparison with confidence intervals - shows our method is better"""
         fig, ax = plt.subplots(figsize=(11, 6))
 
-        if siamese_acc is not None:
+        # Extract accuracy values (handle both dict and float formats)
+        def get_acc(x):
+            return x['acc'] if isinstance(x, dict) else x
+        def get_ci(x):
+            return x.get('ci', None) if isinstance(x, dict) else None
+
+        our_acc = get_acc(our_result)
+        our_ci = get_ci(our_result)
+
+        if siamese_result is not None:
+            siamese_acc = get_acc(siamese_result)
+            siamese_ci = get_ci(siamese_result)
             methods = ['ICP', 'CPD', 'Hungarian', 'Siamese\nTransformer', 'Twin Attention\n(Ours)']
             accs = [baselines['icp'] * 100, baselines['cpd'] * 100,
                     baselines['hungarian'] * 100, siamese_acc * 100, our_acc * 100]
             colors = [self.COLORS['baseline1'], self.COLORS['baseline2'],
                       self.COLORS['baseline3'], self.COLORS['secondary'], self.COLORS['primary']]
+            # Build error arrays (only Siamese and Twin Attention have CIs)
+            errors = [[0, 0], [0, 0], [0, 0]]
+            if siamese_ci:
+                errors.append([siamese_acc*100 - siamese_ci[0]*100, siamese_ci[1]*100 - siamese_acc*100])
+            else:
+                errors.append([0, 0])
+            if our_ci:
+                errors.append([our_acc*100 - our_ci[0]*100, our_ci[1]*100 - our_acc*100])
+            else:
+                errors.append([0, 0])
         else:
             methods = ['ICP', 'CPD', 'Hungarian', 'Twin Attention\n(Ours)']
             accs = [baselines['icp'] * 100, baselines['cpd'] * 100,
                     baselines['hungarian'] * 100, our_acc * 100]
             colors = [self.COLORS['baseline1'], self.COLORS['baseline2'],
                       self.COLORS['baseline3'], self.COLORS['primary']]
+            errors = [[0, 0], [0, 0], [0, 0]]
+            if our_ci:
+                errors.append([our_acc*100 - our_ci[0]*100, our_ci[1]*100 - our_acc*100])
+            else:
+                errors.append([0, 0])
 
-        bars = ax.bar(methods, accs, color=colors, edgecolor='white', linewidth=1.5)
+        bars = ax.bar(methods, accs, color=colors, edgecolor='white', linewidth=1.5,
+                      yerr=np.array(errors).T, capsize=5, error_kw={'linewidth': 1.5})
 
         ax.axhline(90, color=self.COLORS['success'], linestyle='--', alpha=0.7, linewidth=2, label='90% threshold')
         ax.set_ylabel('Identification Accuracy (%)', fontweight='bold')
@@ -1570,7 +1598,7 @@ class FigureGenerator:
         ax.legend(loc='upper left', frameon=True, fancybox=False, edgecolor='#CCCCCC')
 
         for bar, a in zip(bars, accs):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1.5,
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 3,
                    f'{a:.1f}%', ha='center', fontsize=11, fontweight='bold')
 
         # Highlight our method with border
@@ -1580,14 +1608,32 @@ class FigureGenerator:
         self.save(fig, name)
 
     def fig_robustness_missing(self, results, name="fig_robustness_missing.png"):
-        """Missing cells robustness curve"""
+        """Missing cells robustness curve with error bars"""
         fig, ax = plt.subplots(figsize=(8, 6))
 
         fracs = sorted(results['missing'].keys())
-        accs = [results['missing'][f] * 100 for f in fracs]
+        # Handle dict format with CI
+        def get_acc(x):
+            return x['acc'] if isinstance(x, dict) else x
+        def get_ci(x):
+            return x.get('ci', None) if isinstance(x, dict) else None
 
-        ax.plot([f*100 for f in fracs], accs, 'o-', color='#3498db',
-               linewidth=3, markersize=12, markerfacecolor='white', markeredgewidth=3)
+        accs = [get_acc(results['missing'][f]) * 100 for f in fracs]
+        errors_low = []
+        errors_high = []
+        for f in fracs:
+            ci = get_ci(results['missing'][f])
+            if ci:
+                acc = get_acc(results['missing'][f]) * 100
+                errors_low.append(acc - ci[0] * 100)
+                errors_high.append(ci[1] * 100 - acc)
+            else:
+                errors_low.append(0)
+                errors_high.append(0)
+
+        ax.errorbar([f*100 for f in fracs], accs, yerr=[errors_low, errors_high],
+                   fmt='o-', color='#3498db', linewidth=3, markersize=12,
+                   markerfacecolor='white', markeredgewidth=3, capsize=5, capthick=2)
 
         ax.fill_between([f*100 for f in fracs], accs, alpha=0.2, color='#3498db')
         ax.axhline(80, color='#e74c3c', linestyle='--', alpha=0.7, linewidth=2, label='80% threshold')
@@ -1601,19 +1647,37 @@ class FigureGenerator:
 
         for f, a in zip(fracs, accs):
             ax.annotate(f'{a:.1f}%', (f*100, a), textcoords="offset points",
-                       xytext=(0, 12), ha='center', fontsize=10, fontweight='bold')
+                       xytext=(0, 15), ha='center', fontsize=10, fontweight='bold')
 
         self.save(fig, name)
 
     def fig_robustness_noise(self, results, name="fig_robustness_noise.png"):
-        """Coordinate noise robustness curve"""
+        """Coordinate noise robustness curve with error bars"""
         fig, ax = plt.subplots(figsize=(8, 6))
 
         scales = sorted(results['noise'].keys())
-        accs = [results['noise'][s] * 100 for s in scales]
+        # Handle dict format with CI
+        def get_acc(x):
+            return x['acc'] if isinstance(x, dict) else x
+        def get_ci(x):
+            return x.get('ci', None) if isinstance(x, dict) else None
 
-        ax.plot(scales, accs, 's-', color='#27ae60',
-               linewidth=3, markersize=12, markerfacecolor='white', markeredgewidth=3)
+        accs = [get_acc(results['noise'][s]) * 100 for s in scales]
+        errors_low = []
+        errors_high = []
+        for s in scales:
+            ci = get_ci(results['noise'][s])
+            if ci:
+                acc = get_acc(results['noise'][s]) * 100
+                errors_low.append(acc - ci[0] * 100)
+                errors_high.append(ci[1] * 100 - acc)
+            else:
+                errors_low.append(0)
+                errors_high.append(0)
+
+        ax.errorbar(scales, accs, yerr=[errors_low, errors_high],
+                   fmt='s-', color='#27ae60', linewidth=3, markersize=12,
+                   markerfacecolor='white', markeredgewidth=3, capsize=5, capthick=2)
 
         ax.fill_between(scales, accs, alpha=0.2, color='#27ae60')
         ax.axhline(80, color='#e74c3c', linestyle='--', alpha=0.7, linewidth=2, label='80% threshold')
@@ -1626,21 +1690,31 @@ class FigureGenerator:
 
         for s, a in zip(scales, accs):
             ax.annotate(f'{a:.1f}%', (s, a), textcoords="offset points",
-                       xytext=(0, 12), ha='center', fontsize=10, fontweight='bold')
+                       xytext=(0, 15), ha='center', fontsize=10, fontweight='bold')
 
         self.save(fig, name)
 
     def fig_ablation_architecture(self, results, name="fig_ablation_architecture.png"):
-        """Architecture ablation bar chart"""
+        """Architecture ablation bar chart with error bars"""
         fig, ax = plt.subplots(figsize=(10, 6))
 
         names = list(results.keys())
-        accs = [results[n] * 100 for n in names]
+        # Handle both dict format (with CI) and simple float format
+        accs = [results[n]['acc'] * 100 if isinstance(results[n], dict) else results[n] * 100 for n in names]
+        errors = []
+        for n in names:
+            if isinstance(results[n], dict) and 'ci' in results[n]:
+                ci = results[n]['ci']
+                acc = results[n]['acc'] * 100
+                errors.append([acc - ci[0]*100, ci[1]*100 - acc])
+            else:
+                errors.append([0, 0])
 
         # Full model in primary color, ablated versions in gray gradient
         colors = [self.COLORS['primary'] if i == 0 else self.COLORS['baseline2'] for i in range(len(names))]
 
-        bars = ax.barh(names, accs, color=colors, edgecolor='white', linewidth=1.5, height=0.7)
+        bars = ax.barh(names, accs, color=colors, edgecolor='white', linewidth=1.5, height=0.7,
+                       xerr=np.array(errors).T, capsize=4, error_kw={'linewidth': 1.5})
 
         ax.set_xlabel('Identification Accuracy (%)', fontweight='bold')
         ax.set_title('Architecture Ablation Study', fontweight='bold', pad=15)
@@ -1654,15 +1728,25 @@ class FigureGenerator:
         self.save(fig, name)
 
     def fig_ablation_features(self, results, name="fig_ablation_features.png"):
-        """Feature ablation bar chart"""
+        """Feature ablation bar chart with error bars"""
         fig, ax = plt.subplots(figsize=(10, 6))
 
         names = list(results.keys())
-        accs = [results[n] * 100 for n in names]
+        # Handle both dict format (with CI) and simple float format
+        accs = [results[n]['acc'] * 100 if isinstance(results[n], dict) else results[n] * 100 for n in names]
+        errors = []
+        for n in names:
+            if isinstance(results[n], dict) and 'ci' in results[n]:
+                ci = results[n]['ci']
+                acc = results[n]['acc'] * 100
+                errors.append([acc - ci[0]*100, ci[1]*100 - acc])
+            else:
+                errors.append([0, 0])
 
         # Full model in primary color, ablated versions in warning color
         colors = [self.COLORS['primary'] if i == 0 else self.COLORS['warning'] for i in range(len(names))]
-        bars = ax.barh(names, accs, color=colors, edgecolor='white', linewidth=1.5, height=0.7)
+        bars = ax.barh(names, accs, color=colors, edgecolor='white', linewidth=1.5, height=0.7,
+                       xerr=np.array(errors).T, capsize=4, error_kw={'linewidth': 1.5})
 
         ax.set_xlabel('Identification Accuracy (%)', fontweight='bold')
         ax.set_title('Feature Ablation Study', fontweight='bold', pad=15)
@@ -1673,6 +1757,37 @@ class FigureGenerator:
                    f'{a:.1f}%', va='center', fontsize=10, fontweight='bold')
 
         ax.invert_yaxis()
+        self.save(fig, name)
+
+    def fig_ablation_curriculum(self, results, name="fig_ablation_curriculum.png"):
+        """Curriculum learning ablation bar chart with error bars"""
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        names = list(results.keys())
+        # Handle both dict format (with CI) and simple float format
+        accs = [results[n]['acc'] * 100 if isinstance(results[n], dict) else results[n] * 100 for n in names]
+        errors = []
+        for n in names:
+            if isinstance(results[n], dict) and 'ci' in results[n]:
+                ci = results[n]['ci']
+                acc = results[n]['acc'] * 100
+                errors.append([acc - ci[0]*100, ci[1]*100 - acc])
+            else:
+                errors.append([0, 0])
+
+        # With curriculum in primary, without in warning
+        colors = [self.COLORS['primary'] if 'With' in n else self.COLORS['warning'] for n in names]
+        bars = ax.bar(names, accs, color=colors, edgecolor='white', linewidth=1.5, width=0.6,
+                      yerr=np.array(errors).T, capsize=6, error_kw={'linewidth': 1.5})
+
+        ax.set_ylabel('Identification Accuracy (%)', fontweight='bold')
+        ax.set_title('Curriculum Learning Ablation', fontweight='bold', pad=15)
+        ax.set_ylim(0, 105)
+
+        for bar, a in zip(bars, accs):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
+                   f'{a:.1f}%', ha='center', fontsize=11, fontweight='bold')
+
         self.save(fig, name)
 
     def fig_embedding_tsne(self, embeddings, labels, name="fig_embedding_tsne.png"):
@@ -1871,21 +1986,31 @@ class EvaluationRunner:
         # Siamese Transformer baseline (same KNN pipeline as our method)
         print("\n--- Siamese Transformer Baseline (KNN Identification) ---")
         siamese_eval = SiameseBaselineEvaluator(self.config, train_data, eval_data)
-        siamese_acc = siamese_eval.train_and_evaluate()
-        baselines['siamese'] = siamese_acc
+        siamese_result = siamese_eval.train_and_evaluate()
+        baselines['siamese'] = siamese_result
 
         self.results['baselines'] = baselines
 
+        # Helper to extract acc from dict or float
+        def get_acc(x):
+            return x['acc'] if isinstance(x, dict) else x
+
+        siamese_acc = get_acc(siamese_result)
         print("\n--- Baseline Summary (Identification Accuracy) ---")
         print(f"  ICP: {baselines['icp']*100:.1f}%")
         print(f"  CPD: {baselines['cpd']*100:.1f}%")
         print(f"  Hungarian: {baselines['hungarian']*100:.1f}%")
-        print(f"  Siamese Transformer: {siamese_acc*100:.1f}%")
-        print(f"  Twin Attention (Ours): {knn_results['overall_accuracy']*100:.1f}%")
+        if isinstance(siamese_result, dict) and 'ci' in siamese_result:
+            print(f"  Siamese Transformer: {siamese_acc*100:.1f}% [CI: {siamese_result['ci'][0]*100:.1f}-{siamese_result['ci'][1]*100:.1f}%]")
+        else:
+            print(f"  Siamese Transformer: {siamese_acc*100:.1f}%")
+        print(f"  Twin Attention (Ours): {knn_results['overall_accuracy']*100:.1f}% [CI: {knn_results['ci'][0]*100:.1f}-{knn_results['ci'][1]*100:.1f}%]")
         print(f"\n  Improvement over Siamese: +{(knn_results['overall_accuracy'] - siamese_acc)*100:.1f}pp")
 
         print("\nGenerating Section 3.2 figure...")
-        self.fig_gen.fig_baseline_comparison(baselines, knn_results['overall_accuracy'], siamese_acc)
+        # Pass full results with CI
+        our_result = {'acc': knn_results['overall_accuracy'], 'ci': knn_results['ci']}
+        self.fig_gen.fig_baseline_comparison(baselines, our_result, siamese_result)
 
         # =================================================================
         # SECTION 3.3: Robustness
@@ -1925,18 +2050,31 @@ class EvaluationRunner:
 
         print("\n--- Ablation Summary ---")
         print("Architecture (smaller vs bigger models):")
-        for name, acc in arch_ablations.items():
-            print(f"  {name}: {acc*100:.1f}%")
+        for name, res in arch_ablations.items():
+            acc = res['acc'] if isinstance(res, dict) else res
+            if isinstance(res, dict) and 'ci' in res:
+                print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
+            else:
+                print(f"  {name}: {acc*100:.1f}%")
         print("\nFeature contributions:")
-        for name, acc in feat_ablations.items():
-            print(f"  {name}: {acc*100:.1f}%")
+        for name, res in feat_ablations.items():
+            acc = res['acc'] if isinstance(res, dict) else res
+            if isinstance(res, dict) and 'ci' in res:
+                print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
+            else:
+                print(f"  {name}: {acc*100:.1f}%")
         print("\nCurriculum learning:")
-        for name, acc in curr_ablations.items():
-            print(f"  {name}: {acc*100:.1f}%")
+        for name, res in curr_ablations.items():
+            acc = res['acc'] if isinstance(res, dict) else res
+            if isinstance(res, dict) and 'ci' in res:
+                print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
+            else:
+                print(f"  {name}: {acc*100:.1f}%")
 
         print("\nGenerating ablation figures...")
         self.fig_gen.fig_ablation_architecture(arch_ablations)
         self.fig_gen.fig_ablation_features(feat_ablations)
+        self.fig_gen.fig_ablation_curriculum(curr_ablations)
 
         # =================================================================
         # SECTION 3.6: Embedding & Error Analysis
