@@ -70,6 +70,10 @@ class EvalConfig:
     MAX_TRAIN_EMBEDDINGS = 50000
     KNN_BATCH_SIZE = 1000
 
+    # Skip sections: set to 3.4 to start from ablations, 3.7 for real embryo only
+    # Options: "3.1", "3.2", "3.3", "3.4", "3.6", "3.7"
+    START_FROM_SECTION = "3.4"  # Start from ablations
+
 
 def convert_path(path):
     if path is None:
@@ -1226,7 +1230,7 @@ class AblationEvaluator:
 
         # Accuracy with bootstrap CI
         unique_correct = [1 if p == t else 0 for p, t in zip(unique_preds, unique_labels)]
-        accuracy, ci_low, ci_high = bootstrap_ci(unique_correct, n_bootstrap=50)
+        accuracy, ci_low, ci_high = bootstrap_ci(unique_correct, n=50)
 
         print(f"    KNN Accuracy: {accuracy*100:.1f}% [95% CI: {ci_low*100:.1f}%-{ci_high*100:.1f}%]")
 
@@ -1898,6 +1902,16 @@ class EvaluationRunner:
         print("TWIN ATTENTION MODEL - COMPREHENSIVE EVALUATION")
         print("="*70)
 
+        # Section ordering for skip logic
+        section_order = ["3.1", "3.2", "3.3", "3.4", "3.6", "3.7"]
+        start_section = getattr(self.config, 'START_FROM_SECTION', "3.1")
+        start_idx = section_order.index(start_section) if start_section in section_order else 0
+
+        def should_run(section):
+            return section_order.index(section) >= start_idx
+
+        print(f"Starting from section {start_section}")
+
         data = load_data(self.config)
         model = load_model(self.config)
 
@@ -1908,8 +1922,9 @@ class EvaluationRunner:
             print("ERROR: No data!")
             return
 
-        # Create datasets
+        # Create datasets (needed for most sections)
         print("\nCreating datasets...")
+        train_loader, eval_loader = None, None
         if train_data:
             train_ds = SparseEmbryoDataset(train_data, stage_limit=self.config.STAGE_LIMIT,
                                            min_cells=self.config.MIN_CELLS, max_cells=self.config.MAX_CELLS,
@@ -1923,185 +1938,207 @@ class EvaluationRunner:
         eval_loader = DataLoader(eval_ds, batch_size=self.config.BATCH_SIZE,
                                  shuffle=False, collate_fn=collate_fn_with_padding, num_workers=0)
 
+        # Initialize placeholders for results needed by later sections
+        knn_results = None
+        match_results = None
+
         # =================================================================
         # SECTION 3.1: Core Performance
         # =================================================================
-        print("\n" + "="*60)
-        print("SECTION 3.1: CORE PERFORMANCE")
-        print("="*60)
+        if should_run("3.1"):
+            print("\n" + "="*60)
+            print("SECTION 3.1: CORE PERFORMANCE")
+            print("="*60)
 
-        print("\n--- Direct Matching (Primary Result) ---")
-        match_eval = MatchingEvaluator(model, self.config)
-        match_results = match_eval.evaluate(eval_loader, "Direct Matching")
+            print("\n--- Direct Matching (Primary Result) ---")
+            match_eval = MatchingEvaluator(model, self.config)
+            match_results = match_eval.evaluate(eval_loader, "Direct Matching")
 
-        print(f"\n  Match Accuracy: {match_results['match_accuracy']*100:.1f}% ({match_results['match_correct']}/{match_results['match_total']})")
-        print(f"  Outlier Accuracy: {match_results['outlier_accuracy']*100:.1f}% ({match_results['outlier_correct']}/{match_results['outlier_total']})")
-        print(f"  Overall Accuracy: {match_results['overall_accuracy']*100:.1f}%")
-        print(f"  Loss: {match_results['loss']:.4f}")
+            print(f"\n  Match Accuracy: {match_results['match_accuracy']*100:.1f}% ({match_results['match_correct']}/{match_results['match_total']})")
+            print(f"  Outlier Accuracy: {match_results['outlier_accuracy']*100:.1f}% ({match_results['outlier_correct']}/{match_results['outlier_total']})")
+            print(f"  Overall Accuracy: {match_results['overall_accuracy']*100:.1f}%")
+            print(f"  Loss: {match_results['loss']:.4f}")
 
-        self.results['matching'] = match_results
+            self.results['matching'] = match_results
 
-        # Print by_size from matching results
-        print(f"\n  By neighborhood size (direct matching):")
-        for k, v in match_results['by_size'].items():
-            print(f"    {k}: {v['accuracy']*100:.1f}% (n={v['count']})")
+            # Print by_size from matching results
+            print(f"\n  By neighborhood size (direct matching):")
+            for k, v in match_results['by_size'].items():
+                print(f"    {k}: {v['accuracy']*100:.1f}% (n={v['count']})")
 
-        # KNN Identification
-        print("\n--- KNN Cell Identification ---")
-        knn_eval = KNNEvaluator(model, self.config)
-        knn_results = knn_eval.evaluate(train_loader, eval_loader)
+            # KNN Identification
+            print("\n--- KNN Cell Identification ---")
+            knn_eval = KNNEvaluator(model, self.config)
+            knn_results = knn_eval.evaluate(train_loader, eval_loader)
 
-        print(f"\n  KNN Accuracy: {knn_results['overall_accuracy']*100:.1f}% (on {knn_results['unique_cells']} unique cells)")
-        print(f"    95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]")
-        print(f"\n  Hierarchical accuracy (KNN):")
-        for k, v in knn_results['hierarchical'].items():
-            print(f"    {k}: {v*100:.1f}%")
+            print(f"\n  KNN Accuracy: {knn_results['overall_accuracy']*100:.1f}% (on {knn_results['unique_cells']} unique cells)")
+            print(f"    95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]")
+            print(f"\n  Hierarchical accuracy (KNN):")
+            for k, v in knn_results['hierarchical'].items():
+                print(f"    {k}: {v*100:.1f}%")
 
-        self.results['knn'] = knn_results
+            self.results['knn'] = knn_results
 
-        # Generate Section 3.1 figures
-        print("\nGenerating Section 3.1 figures...")
-        self.fig_gen.fig_matching_accuracy(match_results)
-        self.fig_gen.fig_knn_accuracy(knn_results)
-        self.fig_gen.fig_accuracy_by_size(match_results)  # Use matching results
-        self.fig_gen.fig_hierarchical(knn_results)
+            # Generate Section 3.1 figures
+            print("\nGenerating Section 3.1 figures...")
+            self.fig_gen.fig_matching_accuracy(match_results)
+            self.fig_gen.fig_knn_accuracy(knn_results)
+            self.fig_gen.fig_accuracy_by_size(match_results)  # Use matching results
+            self.fig_gen.fig_hierarchical(knn_results)
+        else:
+            print("\n[Skipping Section 3.1: Core Performance]")
 
         # =================================================================
         # SECTION 3.2: Baselines (all evaluated on IDENTIFICATION task)
         # =================================================================
-        print("\n" + "="*60)
-        print("SECTION 3.2: BASELINE COMPARISON (Identification Task)")
-        print("="*60)
+        if should_run("3.2"):
+            print("\n" + "="*60)
+            print("SECTION 3.2: BASELINE COMPARISON (Identification Task)")
+            print("="*60)
 
-        # Geometric baselines - identification via exhaustive neighborhood comparison
-        print("\n--- Geometric Baselines (Identification via Alignment) ---")
-        baseline_eval = BaselineEvaluator(self.config)
-        baseline_eval.build_reference_database(train_data)
+            # Geometric baselines - identification via exhaustive neighborhood comparison
+            print("\n--- Geometric Baselines (Identification via Alignment) ---")
+            baseline_eval = BaselineEvaluator(self.config)
+            baseline_eval.build_reference_database(train_data)
 
-        baselines = {}
-        for method in ['icp', 'cpd', 'hungarian']:
-            acc, hier = baseline_eval.evaluate(eval_data, method, n_samples=300)
-            baselines[method] = acc
+            baselines = {}
+            for method in ['icp', 'cpd', 'hungarian']:
+                acc, hier = baseline_eval.evaluate(eval_data, method, n_samples=300)
+                baselines[method] = acc
 
-        # Siamese Transformer baseline (same KNN pipeline as our method)
-        print("\n--- Siamese Transformer Baseline (KNN Identification) ---")
-        siamese_eval = SiameseBaselineEvaluator(self.config, train_data, eval_data)
-        siamese_result = siamese_eval.train_and_evaluate()
-        baselines['siamese'] = siamese_result
+            # Siamese Transformer baseline (same KNN pipeline as our method)
+            print("\n--- Siamese Transformer Baseline (KNN Identification) ---")
+            siamese_eval = SiameseBaselineEvaluator(self.config, train_data, eval_data)
+            siamese_result = siamese_eval.train_and_evaluate()
+            baselines['siamese'] = siamese_result
 
-        self.results['baselines'] = baselines
+            self.results['baselines'] = baselines
 
-        # Helper to extract acc from dict or float
-        def get_acc(x):
-            return x['acc'] if isinstance(x, dict) else x
+            # Helper to extract acc from dict or float
+            def get_acc(x):
+                return x['acc'] if isinstance(x, dict) else x
 
-        siamese_acc = get_acc(siamese_result)
-        print("\n--- Baseline Summary (Identification Accuracy) ---")
-        print(f"  ICP: {baselines['icp']*100:.1f}%")
-        print(f"  CPD: {baselines['cpd']*100:.1f}%")
-        print(f"  Hungarian: {baselines['hungarian']*100:.1f}%")
-        if isinstance(siamese_result, dict) and 'ci' in siamese_result:
-            print(f"  Siamese Transformer: {siamese_acc*100:.1f}% [CI: {siamese_result['ci'][0]*100:.1f}-{siamese_result['ci'][1]*100:.1f}%]")
+            siamese_acc = get_acc(siamese_result)
+            print("\n--- Baseline Summary (Identification Accuracy) ---")
+            print(f"  ICP: {baselines['icp']*100:.1f}%")
+            print(f"  CPD: {baselines['cpd']*100:.1f}%")
+            print(f"  Hungarian: {baselines['hungarian']*100:.1f}%")
+            if isinstance(siamese_result, dict) and 'ci' in siamese_result:
+                print(f"  Siamese Transformer: {siamese_acc*100:.1f}% [CI: {siamese_result['ci'][0]*100:.1f}-{siamese_result['ci'][1]*100:.1f}%]")
+            else:
+                print(f"  Siamese Transformer: {siamese_acc*100:.1f}%")
+
+            if knn_results:
+                print(f"  Twin Attention (Ours): {knn_results['overall_accuracy']*100:.1f}% [CI: {knn_results['ci'][0]*100:.1f}-{knn_results['ci'][1]*100:.1f}%]")
+                print(f"\n  Improvement over Siamese: +{(knn_results['overall_accuracy'] - siamese_acc)*100:.1f}pp")
+
+                print("\nGenerating Section 3.2 figure...")
+                our_result = {'acc': knn_results['overall_accuracy'], 'ci': knn_results['ci']}
+                self.fig_gen.fig_baseline_comparison(baselines, our_result, siamese_result)
         else:
-            print(f"  Siamese Transformer: {siamese_acc*100:.1f}%")
-        print(f"  Twin Attention (Ours): {knn_results['overall_accuracy']*100:.1f}% [CI: {knn_results['ci'][0]*100:.1f}-{knn_results['ci'][1]*100:.1f}%]")
-        print(f"\n  Improvement over Siamese: +{(knn_results['overall_accuracy'] - siamese_acc)*100:.1f}pp")
-
-        print("\nGenerating Section 3.2 figure...")
-        # Pass full results with CI
-        our_result = {'acc': knn_results['overall_accuracy'], 'ci': knn_results['ci']}
-        self.fig_gen.fig_baseline_comparison(baselines, our_result, siamese_result)
+            print("\n[Skipping Section 3.2: Baselines]")
 
         # =================================================================
         # SECTION 3.3: Robustness
         # =================================================================
-        print("\n" + "="*60)
-        print("SECTION 3.3: ROBUSTNESS")
-        print("="*60)
+        if should_run("3.3"):
+            print("\n" + "="*60)
+            print("SECTION 3.3: ROBUSTNESS")
+            print("="*60)
 
-        robust_eval = RobustnessEvaluator(model, self.config)
-        robust_results = robust_eval.run_sweeps(eval_loader)
-        self.results['robustness'] = robust_results
+            robust_eval = RobustnessEvaluator(model, self.config)
+            robust_results = robust_eval.run_sweeps(eval_loader)
+            self.results['robustness'] = robust_results
 
-        print("\nGenerating Section 3.3 figures...")
-        self.fig_gen.fig_robustness_missing(robust_results)
-        self.fig_gen.fig_robustness_noise(robust_results)
+            print("\nGenerating Section 3.3 figures...")
+            self.fig_gen.fig_robustness_missing(robust_results)
+            self.fig_gen.fig_robustness_noise(robust_results)
+        else:
+            print("\n[Skipping Section 3.3: Robustness]")
 
         # =================================================================
         # SECTION 3.4 & 3.5: Ablations
         # =================================================================
-        print("\n" + "="*60)
-        print("SECTIONS 3.4-3.5: ABLATION STUDIES")
-        print("="*60)
+        if should_run("3.4"):
+            print("\n" + "="*60)
+            print("SECTIONS 3.4-3.5: ABLATION STUDIES")
+            print("="*60)
 
-        ablation_eval = AblationEvaluator(self.config, train_data, eval_data)
+            ablation_eval = AblationEvaluator(self.config, train_data, eval_data)
 
-        print("\nRunning architecture ablations (model size comparison)...")
-        arch_ablations = ablation_eval.run_architecture_ablations()
-        self.results['arch_ablations'] = arch_ablations
+            print("\nRunning architecture ablations (model size comparison)...")
+            arch_ablations = ablation_eval.run_architecture_ablations()
+            self.results['arch_ablations'] = arch_ablations
 
-        print("\nRunning feature ablations...")
-        feat_ablations = ablation_eval.run_feature_ablations()
-        self.results['feat_ablations'] = feat_ablations
+            print("\nRunning feature ablations...")
+            feat_ablations = ablation_eval.run_feature_ablations()
+            self.results['feat_ablations'] = feat_ablations
 
-        print("\nRunning curriculum learning ablation...")
-        curr_ablations = ablation_eval.run_curriculum_ablation()
-        self.results['curriculum_ablations'] = curr_ablations
+            print("\nRunning curriculum learning ablation...")
+            curr_ablations = ablation_eval.run_curriculum_ablation()
+            self.results['curriculum_ablations'] = curr_ablations
 
-        print("\n--- Ablation Summary ---")
-        print("Architecture (smaller vs bigger models):")
-        for name, res in arch_ablations.items():
-            acc = res['acc'] if isinstance(res, dict) else res
-            if isinstance(res, dict) and 'ci' in res:
-                print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
-            else:
-                print(f"  {name}: {acc*100:.1f}%")
-        print("\nFeature contributions:")
-        for name, res in feat_ablations.items():
-            acc = res['acc'] if isinstance(res, dict) else res
-            if isinstance(res, dict) and 'ci' in res:
-                print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
-            else:
-                print(f"  {name}: {acc*100:.1f}%")
-        print("\nCurriculum learning:")
-        for name, res in curr_ablations.items():
-            acc = res['acc'] if isinstance(res, dict) else res
-            if isinstance(res, dict) and 'ci' in res:
-                print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
-            else:
-                print(f"  {name}: {acc*100:.1f}%")
+            print("\n--- Ablation Summary ---")
+            print("Architecture (smaller vs bigger models):")
+            for name, res in arch_ablations.items():
+                acc = res['acc'] if isinstance(res, dict) else res
+                if isinstance(res, dict) and 'ci' in res:
+                    print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
+                else:
+                    print(f"  {name}: {acc*100:.1f}%")
+            print("\nFeature contributions:")
+            for name, res in feat_ablations.items():
+                acc = res['acc'] if isinstance(res, dict) else res
+                if isinstance(res, dict) and 'ci' in res:
+                    print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
+                else:
+                    print(f"  {name}: {acc*100:.1f}%")
+            print("\nCurriculum learning:")
+            for name, res in curr_ablations.items():
+                acc = res['acc'] if isinstance(res, dict) else res
+                if isinstance(res, dict) and 'ci' in res:
+                    print(f"  {name}: {acc*100:.1f}% [CI: {res['ci'][0]*100:.1f}-{res['ci'][1]*100:.1f}%]")
+                else:
+                    print(f"  {name}: {acc*100:.1f}%")
 
-        print("\nGenerating ablation figures...")
-        self.fig_gen.fig_ablation_architecture(arch_ablations)
-        self.fig_gen.fig_ablation_features(feat_ablations)
-        self.fig_gen.fig_ablation_curriculum(curr_ablations)
+            print("\nGenerating ablation figures...")
+            self.fig_gen.fig_ablation_architecture(arch_ablations)
+            self.fig_gen.fig_ablation_features(feat_ablations)
+            self.fig_gen.fig_ablation_curriculum(curr_ablations)
+        else:
+            print("\n[Skipping Sections 3.4-3.5: Ablations]")
 
         # =================================================================
         # SECTION 3.6: Embedding & Error Analysis
         # =================================================================
-        print("\n" + "="*60)
-        print("SECTION 3.6: EMBEDDING & ERROR ANALYSIS")
-        print("="*60)
+        if should_run("3.6") and knn_results:
+            print("\n" + "="*60)
+            print("SECTION 3.6: EMBEDDING & ERROR ANALYSIS")
+            print("="*60)
 
-        error_analyzer = ErrorAnalyzer()
-        errors = error_analyzer.analyze(knn_results)
-        print(f"\n  Total errors: {errors['total']}")
-        for k, v in errors['percentages'].items():
-            if v > 0:
-                print(f"    {k}: {v:.1f}%")
+            error_analyzer = ErrorAnalyzer()
+            errors = error_analyzer.analyze(knn_results)
+            print(f"\n  Total errors: {errors['total']}")
+            for k, v in errors['percentages'].items():
+                if v > 0:
+                    print(f"    {k}: {v:.1f}%")
 
-        self.results['errors'] = errors
+            self.results['errors'] = errors
 
-        print("\nGenerating Section 3.6 figures...")
-        self.fig_gen.fig_embedding_tsne(knn_results['test_embeddings'], knn_results['test_labels'])
-        self.fig_gen.fig_error_distribution(errors)
-        self.fig_gen.fig_confidence_histogram(knn_results)
+            print("\nGenerating Section 3.6 figures...")
+            self.fig_gen.fig_embedding_tsne(knn_results['test_embeddings'], knn_results['test_labels'])
+            self.fig_gen.fig_error_distribution(errors)
+            self.fig_gen.fig_confidence_histogram(knn_results)
+        elif should_run("3.6"):
+            print("\n[Skipping Section 3.6: Requires KNN results from Section 3.1]")
+        else:
+            print("\n[Skipping Section 3.6: Embedding & Error Analysis]")
 
         # =================================================================
         # SECTION 3.7: Real Embryo Evaluation
         # =================================================================
         real_data = data.get('real')
-        if real_data:
+        if should_run("3.7") and real_data:
             print("\n" + "="*60)
             print("SECTION 3.7: REAL EMBRYO EVALUATION")
             print("="*60)
@@ -2132,9 +2169,12 @@ class EvaluationRunner:
             # Generate real embryo figure
             self.fig_gen.fig_knn_accuracy(real_knn_results, name="fig_real_embryo_accuracy.png")
 
-            print(f"\n  Comparison: Simulated {knn_results['overall_accuracy']*100:.1f}% vs Real {real_knn_results['overall_accuracy']*100:.1f}%")
+            if knn_results:
+                print(f"\n  Comparison: Simulated {knn_results['overall_accuracy']*100:.1f}% vs Real {real_knn_results['overall_accuracy']*100:.1f}%")
+        elif should_run("3.7"):
+            print("\n[Section 3.7: Real embryo data not available]")
         else:
-            print("\n(Real embryo data not available - skipping Section 3.7)")
+            print("\n[Skipping Section 3.7: Real Embryo Evaluation]")
 
         # =================================================================
         # SAVE RESULTS
@@ -2159,55 +2199,72 @@ class EvaluationRunner:
         with open(os.path.join(self.config.OUTPUT_DIR, 'evaluation_summary.txt'), 'w') as f:
             f.write("TWIN ATTENTION MODEL - EVALUATION SUMMARY\n")
             f.write("="*50 + "\n\n")
+            f.write(f"Started from section: {start_section}\n\n")
 
-            f.write("PRIMARY RESULT: KNN CELL IDENTIFICATION\n")
-            f.write("="*50 + "\n")
-            f.write(f"Simulated Embryos: {knn_results['overall_accuracy']*100:.1f}%\n")
-            f.write(f"  95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]\n")
-            f.write(f"  Unique cells: {knn_results['unique_cells']}\n")
-            if 'real_embryo' in self.results:
-                real_res = self.results['real_embryo']
-                f.write(f"\nReal Embryos: {real_res['overall_accuracy']*100:.1f}%\n")
-                f.write(f"  95% CI: [{real_res['ci'][0]*100:.1f}%, {real_res['ci'][1]*100:.1f}%]\n")
-                f.write(f"  Unique cells: {real_res['unique_cells']}\n")
-            f.write("\n")
+            if knn_results:
+                f.write("PRIMARY RESULT: KNN CELL IDENTIFICATION\n")
+                f.write("="*50 + "\n")
+                f.write(f"Simulated Embryos: {knn_results['overall_accuracy']*100:.1f}%\n")
+                f.write(f"  95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]\n")
+                f.write(f"  Unique cells: {knn_results['unique_cells']}\n")
+                if 'real_embryo' in self.results:
+                    real_res = self.results['real_embryo']
+                    f.write(f"\nReal Embryos: {real_res['overall_accuracy']*100:.1f}%\n")
+                    f.write(f"  95% CI: [{real_res['ci'][0]*100:.1f}%, {real_res['ci'][1]*100:.1f}%]\n")
+                    f.write(f"  Unique cells: {real_res['unique_cells']}\n")
+                f.write("\n")
 
-            f.write("SECTION 3.1: CORE PERFORMANCE\n")
-            f.write("-"*30 + "\n")
-            f.write(f"KNN Identification Accuracy: {knn_results['overall_accuracy']*100:.1f}%\n")
-            f.write(f"  Hierarchical:\n")
-            for k, v in knn_results['hierarchical'].items():
-                f.write(f"    {k}: {v*100:.1f}%\n")
-            f.write(f"\nMatching Accuracy (training objective): {match_results['match_accuracy']*100:.1f}%\n")
-            f.write(f"Outlier Detection Accuracy: {match_results['outlier_accuracy']*100:.1f}%\n\n")
+                f.write("SECTION 3.1: CORE PERFORMANCE\n")
+                f.write("-"*30 + "\n")
+                f.write(f"KNN Identification Accuracy: {knn_results['overall_accuracy']*100:.1f}%\n")
+                f.write(f"  Hierarchical:\n")
+                for k, v in knn_results['hierarchical'].items():
+                    f.write(f"    {k}: {v*100:.1f}%\n")
+                if match_results:
+                    f.write(f"\nMatching Accuracy (training objective): {match_results['match_accuracy']*100:.1f}%\n")
+                    f.write(f"Outlier Detection Accuracy: {match_results['outlier_accuracy']*100:.1f}%\n\n")
 
-            f.write("SECTION 3.2: BASELINE COMPARISON (Identification)\n")
-            f.write("-"*30 + "\n")
-            for m, a in baselines.items():
-                f.write(f"{m.upper()}: {a*100:.1f}%\n")
-            f.write(f"TWIN ATTENTION (Ours): {knn_results['overall_accuracy']*100:.1f}%\n")
-            f.write(f"Improvement over Siamese: +{(knn_results['overall_accuracy'] - baselines['siamese'])*100:.1f}pp\n\n")
+            if 'baselines' in self.results:
+                f.write("\nSECTION 3.2: BASELINE COMPARISON (Identification)\n")
+                f.write("-"*30 + "\n")
+                for m, a in self.results['baselines'].items():
+                    acc = a['acc'] if isinstance(a, dict) else a
+                    f.write(f"{m.upper()}: {acc*100:.1f}%\n")
+                if knn_results:
+                    f.write(f"TWIN ATTENTION (Ours): {knn_results['overall_accuracy']*100:.1f}%\n")
+                    siamese_acc = self.results['baselines']['siamese']
+                    siamese_acc = siamese_acc['acc'] if isinstance(siamese_acc, dict) else siamese_acc
+                    f.write(f"Improvement over Siamese: +{(knn_results['overall_accuracy'] - siamese_acc)*100:.1f}pp\n")
 
-            f.write("SECTION 3.3: ROBUSTNESS\n")
-            f.write("-"*30 + "\n")
-            f.write("Missing cells:\n")
-            for frac, acc in robust_results['missing'].items():
-                f.write(f"  {int(frac*100)}%: {acc*100:.1f}%\n")
-            f.write("Coordinate noise:\n")
-            for scale, acc in robust_results['noise'].items():
-                f.write(f"  {scale}x: {acc*100:.1f}%\n")
+            if 'robustness' in self.results:
+                f.write("\nSECTION 3.3: ROBUSTNESS\n")
+                f.write("-"*30 + "\n")
+                f.write("Missing cells:\n")
+                for frac, res in self.results['robustness']['missing'].items():
+                    acc = res['acc'] if isinstance(res, dict) else res
+                    f.write(f"  {int(frac*100)}%: {acc*100:.1f}%\n")
+                f.write("Coordinate noise:\n")
+                for scale, res in self.results['robustness']['noise'].items():
+                    acc = res['acc'] if isinstance(res, dict) else res
+                    f.write(f"  {scale}x: {acc*100:.1f}%\n")
 
-            f.write("\nSECTIONS 3.4-3.5: ABLATIONS (Identification Accuracy)\n")
-            f.write("-"*30 + "\n")
-            f.write("Architecture:\n")
-            for name, acc in arch_ablations.items():
-                f.write(f"  {name}: {acc*100:.1f}%\n")
-            f.write("Features:\n")
-            for name, acc in feat_ablations.items():
-                f.write(f"  {name}: {acc*100:.1f}%\n")
-            f.write("Curriculum:\n")
-            for name, acc in curr_ablations.items():
-                f.write(f"  {name}: {acc*100:.1f}%\n")
+            if 'arch_ablations' in self.results:
+                f.write("\nSECTIONS 3.4-3.5: ABLATIONS (Identification Accuracy)\n")
+                f.write("-"*30 + "\n")
+                f.write("Architecture:\n")
+                for name, res in self.results['arch_ablations'].items():
+                    acc = res['acc'] if isinstance(res, dict) else res
+                    f.write(f"  {name}: {acc*100:.1f}%\n")
+            if 'feat_ablations' in self.results:
+                f.write("Features:\n")
+                for name, res in self.results['feat_ablations'].items():
+                    acc = res['acc'] if isinstance(res, dict) else res
+                    f.write(f"  {name}: {acc*100:.1f}%\n")
+            if 'curriculum_ablations' in self.results:
+                f.write("Curriculum:\n")
+                for name, res in self.results['curriculum_ablations'].items():
+                    acc = res['acc'] if isinstance(res, dict) else res
+                    f.write(f"  {name}: {acc*100:.1f}%\n")
 
         print(f"\nResults saved to: {self.config.OUTPUT_DIR}")
         print(f"Figures saved to: {self.config.FIGURE_DIR}")
