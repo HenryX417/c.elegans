@@ -89,23 +89,37 @@ def load_data(config):
 
     data = {}
 
+    # Training data (simulated)
     train_path = convert_path(config.TRAIN_DATA_PATH)
     if os.path.exists(train_path):
         print(f"Loading training data from: {train_path}")
         with open(train_path, 'rb') as f:
             data['train'] = pickle.load(f)
-        print(f"  Loaded {len(data['train'])} embryos")
+        print(f"  Loaded {len(data['train'])} embryos (simulated)")
     else:
         data['train'] = None
 
+    # Evaluation data (simulated)
     eval_path = convert_path(config.EVAL_DATA_PATH)
     if os.path.exists(eval_path):
         print(f"Loading evaluation data from: {eval_path}")
         with open(eval_path, 'rb') as f:
             data['eval'] = pickle.load(f)
-        print(f"  Loaded {len(data['eval'])} embryos")
+        print(f"  Loaded {len(data['eval'])} embryos (simulated)")
     else:
         data['eval'] = None
+
+    # Real embryo data (actual experimental data)
+    real_path = convert_path(config.REAL_EMBRYO_PATH)
+    if real_path and os.path.exists(real_path):
+        print(f"Loading real embryo data from: {real_path}")
+        with open(real_path, 'rb') as f:
+            data['real'] = pickle.load(f)
+        print(f"  Loaded {len(data['real'])} real embryos")
+    else:
+        data['real'] = None
+        if config.REAL_EMBRYO_PATH:
+            print(f"  Real embryo data not found at: {real_path}")
 
     # Show sample cell IDs
     sample_data = data.get('train') or data.get('eval')
@@ -852,18 +866,44 @@ class SiameseTransformerEncoder(nn.Module):
 
 class SiameseBaselineEvaluator:
     """
-    Evaluate the Siamese transformer baseline.
-    Trains from scratch and evaluates - should achieve ~75% vs Twin Attention's ~93%
+    Evaluate the Siamese transformer baseline using KNN identification.
+    Same pipeline as Twin Attention: train model → extract embeddings → KNN.
+    Should achieve ~75% vs Twin Attention's ~93%
     """
 
     def __init__(self, config, train_data, eval_data):
         self.config = config
         self.train_data = train_data
         self.eval_data = eval_data
-        self.train_epochs = 20  # More epochs for fair comparison
+        self.train_epochs = 20
+
+    @torch.no_grad()
+    def extract_embeddings(self, model, dataloader, desc="Extracting"):
+        """Extract cell embeddings using Siamese model"""
+        model.eval()
+        embeddings, labels = [], []
+
+        for batch in tqdm(dataloader, desc=desc):
+            pc1, pc2, mask1, mask2, _, info_list = batch
+            pc1 = pc1.to(device)
+            pc2 = pc2.to(device)
+            mask1 = mask1.to(device)
+            mask2 = mask2.to(device)
+
+            # Siamese encodes each neighborhood independently
+            z1_mean, _ = model.encode_single(pc1, mask1)
+
+            for b in range(pc1.shape[0]):
+                n = int(mask1[b].sum().item())
+                info = info_list[b]
+                for i in range(n):
+                    embeddings.append(z1_mean[b, i].cpu().numpy())
+                    labels.append(info['cells1_ids'][i] if i < len(info['cells1_ids']) else f"cell_{i}")
+
+        return np.array(embeddings), labels
 
     def train_and_evaluate(self):
-        """Train Siamese model and evaluate"""
+        """Train Siamese model and evaluate with KNN identification"""
         print("\n  Training Siamese Transformer baseline...")
 
         # Create dataloaders
@@ -872,7 +912,6 @@ class SiameseBaselineEvaluator:
             min_cells=self.config.MIN_CELLS, max_cells=self.config.MAX_CELLS,
             augment=True, num_rotations=3
         )
-        # Subsample for faster training
         if len(train_ds) > 3000:
             indices = np.random.choice(len(train_ds), 3000, replace=False)
             train_ds.pairs = [train_ds.pairs[i] for i in indices]
@@ -891,7 +930,7 @@ class SiameseBaselineEvaluator:
         eval_loader = DataLoader(eval_ds, batch_size=self.config.BATCH_SIZE,
                                  shuffle=False, collate_fn=collate_fn_with_padding, num_workers=0)
 
-        # Create Siamese model (same architecture, different processing)
+        # Create Siamese model
         model = SiameseTransformerEncoder(
             embed_dim=self.config.EMBED_DIM,
             num_heads=self.config.NUM_HEADS,
@@ -907,7 +946,6 @@ class SiameseBaselineEvaluator:
         print(f"    Siamese params: {sum(p.numel() for p in model.parameters()):,}")
 
         # Training loop
-        best_acc = 0
         for epoch in range(self.train_epochs):
             model.train()
             epoch_loss = 0
@@ -925,28 +963,28 @@ class SiameseBaselineEvaluator:
                 optimizer.step()
                 epoch_loss += loss.item()
 
-            # Evaluation
-            if (epoch + 1) % 5 == 0 or epoch == self.train_epochs - 1:
-                model.eval()
-                match_correct, match_total = 0, 0
-                with torch.no_grad():
-                    for batch in eval_loader:
-                        pc1, pc2, mask1, mask2, match_indices, _ = batch
-                        pc1, pc2 = pc1.to(device), pc2.to(device)
-                        mask1, mask2 = mask1.to(device), mask2.to(device)
-                        match_indices = match_indices.to(device)
+            if (epoch + 1) % 5 == 0:
+                print(f"    Epoch {epoch+1}/{self.train_epochs}: loss={epoch_loss/len(train_loader):.3f}")
 
-                        z1, z2, temp = model(pc1, pc2, mask1, mask2, epoch=100)
-                        _, metrics = loss_fn(z1, z2, match_indices, temp, mask1, mask2)
-                        match_correct += metrics['match_correct']
-                        match_total += metrics['match_total']
+        # KNN Identification (same as Twin Attention evaluation)
+        print("  Extracting Siamese embeddings for KNN...")
+        train_emb, train_labels = self.extract_embeddings(model, train_loader, "Train embeddings")
+        test_emb, test_labels = self.extract_embeddings(model, eval_loader, "Test embeddings")
 
-                acc = match_correct / match_total if match_total > 0 else 0
-                best_acc = max(best_acc, acc)
-                print(f"    Epoch {epoch+1}/{self.train_epochs}: loss={epoch_loss/len(train_loader):.3f}, acc={acc*100:.1f}%")
+        print(f"  Building KNN index ({len(train_emb)} train, {len(test_emb)} test)...")
+        knn = KNNIdentifier(k=self.config.K_NEIGHBORS)
+        knn.fit(train_emb, train_labels)
 
-        print(f"  Siamese baseline final accuracy: {best_acc*100:.1f}%")
-        return best_acc
+        predictions, confidences, unique_labels, unique_preds, unique_confs = knn.predict(
+            test_emb, test_labels, batch_size=self.config.KNN_BATCH_SIZE
+        )
+
+        # Compute accuracy on unique cells
+        unique_correct = [1 if p == t else 0 for p, t in zip(unique_preds, unique_labels)]
+        accuracy = np.mean(unique_correct)
+
+        print(f"  Siamese KNN Identification Accuracy: {accuracy*100:.1f}% ({len(unique_labels)} unique cells)")
+        return accuracy
 
 
 # =============================================================================
@@ -1037,19 +1075,14 @@ class RobustnessEvaluator:
 # =============================================================================
 class AblationEvaluator:
     """
-    Run ablation studies by training variant models.
+    Run ablation studies by training variant models and evaluating with KNN identification.
 
     Paper ablations:
     - Architecture: Full (6L) vs Shallow (2L, 4L), heads (2H, 4H, 8H), embed dim (64D, 128D)
     - Features: sparse features, uncertainty, no-match token
     - Training: with/without curriculum learning
 
-    Expected results per paper:
-    - Full model: ~93%
-    - No joint attention (Siamese): 75.4% (-17.9pp) - tested separately
-    - No no-match token: 81.5% (-11.8pp)
-    - No curriculum: 84.6% (-8.7pp)
-    - No sparse features (raw XYZ): 68.3% (-25pp)
+    All ablations measured on KNN IDENTIFICATION accuracy (primary result).
     """
 
     def __init__(self, config, train_data, eval_data):
@@ -1065,7 +1098,7 @@ class AblationEvaluator:
             train_data, stage_limit=self.config.STAGE_LIMIT,
             min_cells=self.config.MIN_CELLS, max_cells=self.config.MAX_CELLS,
             augment=True, num_rotations=3,
-            curriculum_stage=0 if use_curriculum else 3  # Stage 3 = hardest (no curriculum)
+            curriculum_stage=0 if use_curriculum else 3
         )
         if len(train_ds) > n_train:
             indices = np.random.choice(len(train_ds), n_train, replace=False)
@@ -1086,8 +1119,33 @@ class AblationEvaluator:
                                  shuffle=False, collate_fn=collate_fn_with_padding, num_workers=0)
         return train_loader, eval_loader, train_ds
 
+    @torch.no_grad()
+    def extract_embeddings(self, model, dataloader):
+        """Extract cell embeddings for KNN evaluation"""
+        model.eval()
+        embeddings, labels = [], []
+
+        for batch in dataloader:
+            pc1, pc2, mask1, mask2, _, info_list = batch
+            pc1 = pc1.to(device)
+            pc2 = pc2.to(device)
+            mask1 = mask1.to(device)
+            mask2 = mask2.to(device)
+
+            z1, _, _ = model(pc1, pc2, mask1, mask2, epoch=100)
+            z1_mean = z1[0] if model.use_uncertainty else z1
+
+            for b in range(pc1.shape[0]):
+                n = int(mask1[b].sum().item())
+                info = info_list[b]
+                for i in range(n):
+                    embeddings.append(z1_mean[b, i].cpu().numpy())
+                    labels.append(info['cells1_ids'][i] if i < len(info['cells1_ids']) else f"cell_{i}")
+
+        return np.array(embeddings), labels
+
     def train_and_evaluate(self, model_config, train_loader, eval_loader, name, train_ds=None, use_curriculum=True):
-        """Train a model variant and evaluate it"""
+        """Train a model variant and evaluate with KNN identification"""
         print(f"\n  Training: {name}")
 
         # Create model
@@ -1112,9 +1170,7 @@ class AblationEvaluator:
         curriculum_schedule = {0: 0, 4: 1, 8: 2, 12: 3} if use_curriculum else {}
 
         # Training loop
-        best_acc = 0
         for epoch in range(self.ablation_epochs):
-            # Update curriculum if using it
             if train_ds is not None and use_curriculum:
                 for epoch_threshold, stage in curriculum_schedule.items():
                     if epoch >= epoch_threshold:
@@ -1136,28 +1192,27 @@ class AblationEvaluator:
                 optimizer.step()
                 epoch_loss += loss.item()
 
-            # Quick validation every few epochs
-            if (epoch + 1) % 5 == 0 or epoch == self.ablation_epochs - 1:
-                model.eval()
-                match_correct, match_total = 0, 0
-                with torch.no_grad():
-                    for batch in eval_loader:
-                        pc1, pc2, mask1, mask2, match_indices, _ = batch
-                        pc1, pc2 = pc1.to(device), pc2.to(device)
-                        mask1, mask2 = mask1.to(device), mask2.to(device)
-                        match_indices = match_indices.to(device)
+            if (epoch + 1) % 5 == 0:
+                print(f"    Epoch {epoch+1}/{self.ablation_epochs}: loss={epoch_loss/len(train_loader):.3f}")
 
-                        z1, z2, temp = model(pc1, pc2, mask1, mask2, epoch=100)
-                        _, metrics = loss_fn(z1, z2, match_indices, temp, mask1, mask2)
-                        match_correct += metrics['match_correct']
-                        match_total += metrics['match_total']
+        # KNN Identification evaluation
+        print(f"    Extracting embeddings for KNN...")
+        train_emb, train_labels = self.extract_embeddings(model, train_loader)
+        test_emb, test_labels = self.extract_embeddings(model, eval_loader)
 
-                acc = match_correct / match_total if match_total > 0 else 0
-                best_acc = max(best_acc, acc)
-                print(f"    Epoch {epoch+1}/{self.ablation_epochs}: loss={epoch_loss/len(train_loader):.3f}, acc={acc*100:.1f}%")
+        knn = KNNIdentifier(k=self.config.K_NEIGHBORS)
+        knn.fit(train_emb, train_labels)
 
-        print(f"    Final accuracy: {best_acc*100:.1f}%")
-        return best_acc
+        _, _, unique_labels, unique_preds, _ = knn.predict(
+            test_emb, test_labels, batch_size=self.config.KNN_BATCH_SIZE
+        )
+
+        # Accuracy on unique cells
+        unique_correct = [1 if p == t else 0 for p, t in zip(unique_preds, unique_labels)]
+        accuracy = np.mean(unique_correct)
+
+        print(f"    KNN Identification Accuracy: {accuracy*100:.1f}%")
+        return accuracy
 
     def run_architecture_ablations(self):
         """Test different architecture configurations (model depth/size)"""
@@ -1307,6 +1362,24 @@ class ErrorAnalyzer:
 # FIGURE GENERATION - IMPROVED AESTHETICS
 # =============================================================================
 class FigureGenerator:
+    """Generate publication-quality figures with consistent styling"""
+
+    # Consistent color palette
+    COLORS = {
+        'primary': '#2E86AB',      # Deep blue - our method
+        'secondary': '#A23B72',    # Magenta - Siamese
+        'baseline1': '#C4C4C4',    # Light gray - ICP
+        'baseline2': '#9E9E9E',    # Medium gray - CPD
+        'baseline3': '#757575',    # Dark gray - Hungarian
+        'success': '#28A745',      # Green - good performance
+        'warning': '#F18F01',      # Orange - threshold lines
+        'danger': '#C73E1D',       # Red - low performance
+        'accent1': '#3A86FF',      # Bright blue
+        'accent2': '#8338EC',      # Purple
+        'accent3': '#FF006E',      # Pink
+        'light': '#E8E8E8',        # Light background
+    }
+
     def __init__(self, output_dir):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -1316,14 +1389,21 @@ class FigureGenerator:
             'font.size': 12,
             'axes.titlesize': 14,
             'axes.labelsize': 12,
-            'xtick.labelsize': 10,
-            'ytick.labelsize': 10,
+            'xtick.labelsize': 11,
+            'ytick.labelsize': 11,
             'legend.fontsize': 10,
             'figure.dpi': 150,
             'savefig.dpi': 300,
             'font.family': 'sans-serif',
             'axes.spines.top': False,
             'axes.spines.right': False,
+            'axes.grid': False,  # No grids by default
+            'axes.linewidth': 1.2,
+            'axes.edgecolor': '#333333',
+            'xtick.major.width': 1.2,
+            'ytick.major.width': 1.2,
+            'figure.facecolor': 'white',
+            'axes.facecolor': 'white',
         })
 
     def save(self, fig, name):
@@ -1333,7 +1413,7 @@ class FigureGenerator:
         print(f"  Saved: {name}")
 
     def fig_matching_accuracy(self, metrics, name="fig_matching_accuracy.png"):
-        """Main matching performance - bar chart"""
+        """Main matching performance - bar chart (supporting metric)"""
         fig, ax = plt.subplots(figsize=(8, 6))
 
         cats = ['Match\nAccuracy', 'Outlier\nAccuracy', 'Overall\nAccuracy']
@@ -1343,14 +1423,14 @@ class FigureGenerator:
         counts = [metrics['match_total'], metrics['outlier_total'],
                   metrics['match_total'] + metrics['outlier_total']]
 
-        colors = ['#2ecc71', '#f39c12', '#3498db']
-        bars = ax.bar(cats, vals, color=colors, edgecolor='white', linewidth=2)
+        colors = [self.COLORS['success'], self.COLORS['warning'], self.COLORS['primary']]
+        bars = ax.bar(cats, vals, color=colors, edgecolor='white', linewidth=1.5)
 
-        ax.axhline(90, color='#e74c3c', linestyle='--', alpha=0.7, linewidth=2, label='90% threshold')
+        ax.axhline(90, color=self.COLORS['danger'], linestyle='--', alpha=0.7, linewidth=2, label='90% threshold')
         ax.set_ylabel('Accuracy (%)', fontweight='bold')
-        ax.set_ylim(0, 100)
-        ax.set_title('Twin Attention Matching Performance', fontweight='bold', pad=15)
-        ax.legend(loc='lower right')
+        ax.set_ylim(0, 105)
+        ax.set_title('Neighborhood Matching Performance (Training Objective)', fontweight='bold', pad=15)
+        ax.legend(loc='lower right', frameon=True, fancybox=False, edgecolor='#CCCCCC')
 
         for bar, v, n in zip(bars, vals, counts):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1.5,
@@ -1358,27 +1438,26 @@ class FigureGenerator:
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() - 8,
                    f'n={n:,}', ha='center', fontsize=9, color='white')
 
-        ax.set_ylim(0, 105)
         self.save(fig, name)
 
     def fig_knn_accuracy(self, results, name="fig_knn_accuracy.png"):
-        """KNN identification accuracy with CI"""
+        """KNN identification accuracy with CI - PRIMARY RESULT"""
         fig, ax = plt.subplots(figsize=(6, 6))
 
         acc = results['overall_accuracy'] * 100
         ci = results['ci']
 
-        bar = ax.bar(['KNN Cell\nIdentification'], [acc], color='#3498db',
-                    edgecolor='white', linewidth=2, width=0.5)
+        bar = ax.bar(['KNN Cell\nIdentification'], [acc], color=self.COLORS['primary'],
+                    edgecolor='white', linewidth=1.5, width=0.5)
         ax.errorbar(0, acc, yerr=[[acc - ci[0]*100], [ci[1]*100 - acc]],
-                   fmt='none', color='#2c3e50', capsize=10, linewidth=3, capthick=2)
+                   fmt='none', color='#333333', capsize=10, linewidth=2.5, capthick=2)
 
-        ax.axhline(90, color='#e74c3c', linestyle='--', alpha=0.7, linewidth=2)
+        ax.axhline(90, color=self.COLORS['success'], linestyle='--', alpha=0.7, linewidth=2)
         ax.set_ylabel('Accuracy (%)', fontweight='bold')
-        ax.set_ylim(0, 100)
-        ax.set_title(f'KNN Cell Identification (k={30})\n{results["unique_cells"]} unique cells', fontweight='bold', pad=15)
+        ax.set_ylim(0, 105)
+        ax.set_title(f'Cell Identification Accuracy (k={30})\n{results["unique_cells"]} unique cell types', fontweight='bold', pad=15)
 
-        ax.text(0, acc + 5, f'{acc:.1f}%', ha='center', fontsize=16, fontweight='bold', color='#2c3e50')
+        ax.text(0, acc + 4, f'{acc:.1f}%', ha='center', fontsize=16, fontweight='bold', color='#333333')
 
         self.save(fig, name)
 
@@ -1392,17 +1471,18 @@ class FigureGenerator:
         accs = [results['by_size'].get(k, {}).get('accuracy', 0) * 100 for k in keys]
         counts = [results['by_size'].get(k, {}).get('count', 0) for k in keys]
 
-        colors = ['#85c1e9', '#5dade2', '#2980b9']
-        bars = ax.bar(sizes, accs, color=colors, edgecolor='white', linewidth=2)
+        # Gradient of primary color
+        colors = ['#6BB3D9', '#4A9AC9', self.COLORS['primary']]
+        bars = ax.bar(sizes, accs, color=colors, edgecolor='white', linewidth=1.5)
 
-        ax.axhline(90, color='#e74c3c', linestyle='--', alpha=0.7, linewidth=2, label='90% threshold')
-        ax.set_ylabel('Accuracy (%)', fontweight='bold')
-        ax.set_ylim(50, 100)
+        ax.axhline(90, color=self.COLORS['success'], linestyle='--', alpha=0.7, linewidth=2, label='90% threshold')
+        ax.set_ylabel('Identification Accuracy (%)', fontweight='bold')
+        ax.set_ylim(50, 105)
         ax.set_title('Identification Accuracy by Neighborhood Density', fontweight='bold', pad=15)
-        ax.legend(loc='lower right')
+        ax.legend(loc='lower right', frameon=True, fancybox=False, edgecolor='#CCCCCC')
 
         for bar, a, n in zip(bars, accs, counts):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.8,
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
                    f'{a:.1f}%', ha='center', fontsize=11, fontweight='bold')
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() - 5,
                    f'n={n:,}', ha='center', fontsize=9, color='white')
@@ -1418,54 +1498,56 @@ class FigureGenerator:
         accs = [hier['exact'] * 100, hier['sublineage'] * 100,
                 hier['founder'] * 100, hier['binary'] * 100]
 
-        colors = ['#1a5276', '#2471a3', '#5499c7', '#85c1e9']
-        bars = ax.bar(levels, accs, color=colors, edgecolor='white', linewidth=2)
+        # Gradient from dark to light primary
+        colors = [self.COLORS['primary'], '#4A9AC9', '#6BB3D9', '#A8D4EA']
+        bars = ax.bar(levels, accs, color=colors, edgecolor='white', linewidth=1.5)
 
         ax.set_ylabel('Accuracy (%)', fontweight='bold')
-        ax.set_ylim(0, 100)
-        ax.set_title('Hierarchical Identification Accuracy\n(Even errors are biologically close)', fontweight='bold', pad=15)
+        ax.set_ylim(0, 105)
+        ax.set_title('Hierarchical Identification Accuracy\n(Even errors tend to be biologically close)', fontweight='bold', pad=15)
 
         for bar, a in zip(bars, accs):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1.5,
                    f'{a:.1f}%', ha='center', fontsize=12, fontweight='bold')
 
-        # Add annotation
+        # Add annotation arrow
         ax.annotate('', xy=(3, accs[3]), xytext=(0, accs[0]),
-                   arrowprops=dict(arrowstyle='->', color='#27ae60', lw=2))
+                   arrowprops=dict(arrowstyle='->', color=self.COLORS['success'], lw=2))
 
         self.save(fig, name)
 
     def fig_baseline_comparison(self, baselines, our_acc, siamese_acc=None, name="fig_baseline_comparison.png"):
         """Baseline method comparison - shows our method is better"""
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(11, 6))
 
         if siamese_acc is not None:
             methods = ['ICP', 'CPD', 'Hungarian', 'Siamese\nTransformer', 'Twin Attention\n(Ours)']
             accs = [baselines['icp'] * 100, baselines['cpd'] * 100,
                     baselines['hungarian'] * 100, siamese_acc * 100, our_acc * 100]
-            colors = ['#bdc3c7', '#95a5a6', '#7f8c8d', '#f39c12', '#3498db']
+            colors = [self.COLORS['baseline1'], self.COLORS['baseline2'],
+                      self.COLORS['baseline3'], self.COLORS['secondary'], self.COLORS['primary']]
         else:
             methods = ['ICP', 'CPD', 'Hungarian', 'Twin Attention\n(Ours)']
             accs = [baselines['icp'] * 100, baselines['cpd'] * 100,
                     baselines['hungarian'] * 100, our_acc * 100]
-            colors = ['#bdc3c7', '#95a5a6', '#7f8c8d', '#3498db']
+            colors = [self.COLORS['baseline1'], self.COLORS['baseline2'],
+                      self.COLORS['baseline3'], self.COLORS['primary']]
 
-        bars = ax.bar(methods, accs, color=colors, edgecolor='white', linewidth=2)
+        bars = ax.bar(methods, accs, color=colors, edgecolor='white', linewidth=1.5)
 
-        ax.axhline(50, color='#e74c3c', linestyle='--', alpha=0.5, linewidth=2, label='Random baseline')
-        ax.axhline(90, color='#27ae60', linestyle='--', alpha=0.5, linewidth=2, label='90% threshold')
-        ax.set_ylabel('Match Accuracy (%)', fontweight='bold')
-        ax.set_ylim(0, 100)
-        ax.set_title('Comparison with Baseline Methods', fontweight='bold', pad=15)
-        ax.legend(loc='upper left')
+        ax.axhline(90, color=self.COLORS['success'], linestyle='--', alpha=0.7, linewidth=2, label='90% threshold')
+        ax.set_ylabel('Identification Accuracy (%)', fontweight='bold')
+        ax.set_ylim(0, 105)
+        ax.set_title('Cell Identification: Comparison with Baseline Methods', fontweight='bold', pad=15)
+        ax.legend(loc='upper left', frameon=True, fancybox=False, edgecolor='#CCCCCC')
 
         for bar, a in zip(bars, accs):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1.5,
-                   f'{a:.1f}%', ha='center', fontsize=12, fontweight='bold')
+                   f'{a:.1f}%', ha='center', fontsize=11, fontweight='bold')
 
-        # Highlight our method
-        bars[-1].set_edgecolor('#2980b9')
-        bars[-1].set_linewidth(3)
+        # Highlight our method with border
+        bars[-1].set_edgecolor(self.COLORS['primary'])
+        bars[-1].set_linewidth(2.5)
 
         self.save(fig, name)
 
@@ -1483,12 +1565,11 @@ class FigureGenerator:
         ax.axhline(80, color='#e74c3c', linestyle='--', alpha=0.7, linewidth=2, label='80% threshold')
 
         ax.set_xlabel('Cells Removed (%)', fontweight='bold')
-        ax.set_ylabel('Match Accuracy (%)', fontweight='bold')
+        ax.set_ylabel('Identification Accuracy (%)', fontweight='bold')
         ax.set_title('Robustness to Missing Cells', fontweight='bold', pad=15)
         ax.set_ylim(50, 100)
         ax.set_xlim(-2, 42)
-        ax.legend(loc='lower left')
-        ax.grid(True, alpha=0.3, linestyle='-')
+        ax.legend(loc='lower left', frameon=True, fancybox=False, edgecolor='#CCCCCC')
 
         for f, a in zip(fracs, accs):
             ax.annotate(f'{a:.1f}%', (f*100, a), textcoords="offset points",
@@ -1510,11 +1591,10 @@ class FigureGenerator:
         ax.axhline(80, color='#e74c3c', linestyle='--', alpha=0.7, linewidth=2, label='80% threshold')
 
         ax.set_xlabel('Noise Scale (× mean NN distance)', fontweight='bold')
-        ax.set_ylabel('Match Accuracy (%)', fontweight='bold')
+        ax.set_ylabel('Identification Accuracy (%)', fontweight='bold')
         ax.set_title('Robustness to Coordinate Noise', fontweight='bold', pad=15)
         ax.set_ylim(50, 100)
-        ax.legend(loc='lower left')
-        ax.grid(True, alpha=0.3, linestyle='-')
+        ax.legend(loc='lower left', frameon=True, fancybox=False, edgecolor='#CCCCCC')
 
         for s, a in zip(scales, accs):
             ax.annotate(f'{a:.1f}%', (s, a), textcoords="offset points",
@@ -1529,17 +1609,17 @@ class FigureGenerator:
         names = list(results.keys())
         accs = [results[n] * 100 for n in names]
 
-        # Color full model differently
-        colors = ['#3498db' if i == 0 else '#95a5a6' for i in range(len(names))]
+        # Full model in primary color, ablated versions in gray gradient
+        colors = [self.COLORS['primary'] if i == 0 else self.COLORS['baseline2'] for i in range(len(names))]
 
-        bars = ax.barh(names, accs, color=colors, edgecolor='white', linewidth=2)
+        bars = ax.barh(names, accs, color=colors, edgecolor='white', linewidth=1.5, height=0.7)
 
-        ax.set_xlabel('Match Accuracy (%)', fontweight='bold')
+        ax.set_xlabel('Identification Accuracy (%)', fontweight='bold')
         ax.set_title('Architecture Ablation Study', fontweight='bold', pad=15)
-        ax.set_xlim(0, 100)
+        ax.set_xlim(0, 105)
 
         for bar, a in zip(bars, accs):
-            ax.text(a + 1, bar.get_y() + bar.get_height()/2,
+            ax.text(a + 1.5, bar.get_y() + bar.get_height()/2,
                    f'{a:.1f}%', va='center', fontsize=10, fontweight='bold')
 
         ax.invert_yaxis()
@@ -1552,15 +1632,16 @@ class FigureGenerator:
         names = list(results.keys())
         accs = [results[n] * 100 for n in names]
 
-        colors = ['#3498db' if i == 0 else '#e67e22' for i in range(len(names))]
-        bars = ax.barh(names, accs, color=colors, edgecolor='white', linewidth=2)
+        # Full model in primary color, ablated versions in warning color
+        colors = [self.COLORS['primary'] if i == 0 else self.COLORS['warning'] for i in range(len(names))]
+        bars = ax.barh(names, accs, color=colors, edgecolor='white', linewidth=1.5, height=0.7)
 
-        ax.set_xlabel('Match Accuracy (%)', fontweight='bold')
+        ax.set_xlabel('Identification Accuracy (%)', fontweight='bold')
         ax.set_title('Feature Ablation Study', fontweight='bold', pad=15)
-        ax.set_xlim(0, 100)
+        ax.set_xlim(0, 105)
 
         for bar, a in zip(bars, accs):
-            ax.text(a + 1, bar.get_y() + bar.get_height()/2,
+            ax.text(a + 1.5, bar.get_y() + bar.get_height()/2,
                    f'{a:.1f}%', va='center', fontsize=10, fontweight='bold')
 
         ax.invert_yaxis()
@@ -1743,39 +1824,40 @@ class EvaluationRunner:
         self.fig_gen.fig_hierarchical(knn_results)
 
         # =================================================================
-        # SECTION 3.2: Baselines
+        # SECTION 3.2: Baselines (all evaluated on IDENTIFICATION task)
         # =================================================================
         print("\n" + "="*60)
-        print("SECTION 3.2: BASELINE COMPARISON")
+        print("SECTION 3.2: BASELINE COMPARISON (Identification Task)")
         print("="*60)
 
-        # Geometric baselines
-        print("\n--- Geometric Baselines ---")
+        # Geometric baselines - identification via exhaustive neighborhood comparison
+        print("\n--- Geometric Baselines (Identification via Alignment) ---")
         baseline_eval = BaselineEvaluator(self.config)
+        baseline_eval.build_reference_database(train_data)
+
         baselines = {}
         for method in ['icp', 'cpd', 'hungarian']:
-            acc = baseline_eval.evaluate(eval_loader, method)
+            acc, hier = baseline_eval.evaluate(eval_data, method, n_samples=300)
             baselines[method] = acc
-            print(f"  {method.upper()}: {acc*100:.1f}%")
 
-        # Siamese Transformer baseline (independent encoding)
-        print("\n--- Siamese Transformer Baseline ---")
+        # Siamese Transformer baseline (same KNN pipeline as our method)
+        print("\n--- Siamese Transformer Baseline (KNN Identification) ---")
         siamese_eval = SiameseBaselineEvaluator(self.config, train_data, eval_data)
         siamese_acc = siamese_eval.train_and_evaluate()
         baselines['siamese'] = siamese_acc
 
         self.results['baselines'] = baselines
 
-        print("\n--- Summary ---")
+        print("\n--- Baseline Summary (Identification Accuracy) ---")
         print(f"  ICP: {baselines['icp']*100:.1f}%")
         print(f"  CPD: {baselines['cpd']*100:.1f}%")
         print(f"  Hungarian: {baselines['hungarian']*100:.1f}%")
         print(f"  Siamese Transformer: {siamese_acc*100:.1f}%")
-        print(f"  Twin Attention (Ours): {match_results['match_accuracy']*100:.1f}%")
-        print(f"\n  Improvement over Siamese: +{(match_results['match_accuracy'] - siamese_acc)*100:.1f}pp")
+        print(f"  Twin Attention (Ours): {knn_results['overall_accuracy']*100:.1f}%")
+        print(f"\n  Improvement over Siamese: +{(knn_results['overall_accuracy'] - siamese_acc)*100:.1f}pp")
 
         print("\nGenerating Section 3.2 figure...")
-        self.fig_gen.fig_baseline_comparison(baselines, match_results['match_accuracy'], siamese_acc)
+        self.fig_gen.fig_baseline_comparison(baselines, knn_results['overall_accuracy'], siamese_acc)
 
         # =================================================================
         # SECTION 3.3: Robustness
@@ -1850,6 +1932,45 @@ class EvaluationRunner:
         self.fig_gen.fig_confidence_histogram(knn_results)
 
         # =================================================================
+        # SECTION 3.7: Real Embryo Evaluation
+        # =================================================================
+        real_data = data.get('real')
+        if real_data:
+            print("\n" + "="*60)
+            print("SECTION 3.7: REAL EMBRYO EVALUATION")
+            print("="*60)
+
+            # Create dataset for real embryos
+            real_ds = SparseEmbryoDataset(real_data, stage_limit=self.config.STAGE_LIMIT,
+                                          min_cells=self.config.MIN_CELLS, max_cells=self.config.MAX_CELLS,
+                                          augment=False, num_rotations=1)
+            real_loader = DataLoader(real_ds, batch_size=self.config.BATCH_SIZE,
+                                     shuffle=False, collate_fn=collate_fn_with_padding, num_workers=0)
+
+            print(f"\n  Real embryo dataset: {len(real_ds)} samples")
+
+            # KNN evaluation on real data (using training embeddings as reference)
+            print("\n--- KNN Identification on Real Embryos ---")
+            real_knn_eval = KNNEvaluator(model, self.config)
+            real_knn_results = real_knn_eval.evaluate(train_loader, real_loader)
+
+            print(f"\n  Real Embryo KNN Accuracy: {real_knn_results['overall_accuracy']*100:.1f}%")
+            print(f"    95% CI: [{real_knn_results['ci'][0]*100:.1f}%, {real_knn_results['ci'][1]*100:.1f}%]")
+            print(f"    Unique cells tested: {real_knn_results['unique_cells']}")
+            print(f"\n  Hierarchical accuracy (real embryos):")
+            for k, v in real_knn_results['hierarchical'].items():
+                print(f"    {k}: {v*100:.1f}%")
+
+            self.results['real_embryo'] = real_knn_results
+
+            # Generate real embryo figure
+            self.fig_gen.fig_knn_accuracy(real_knn_results, name="fig_real_embryo_accuracy.png")
+
+            print(f"\n  Comparison: Simulated {knn_results['overall_accuracy']*100:.1f}% vs Real {real_knn_results['overall_accuracy']*100:.1f}%")
+        else:
+            print("\n(Real embryo data not available - skipping Section 3.7)")
+
+        # =================================================================
         # SAVE RESULTS
         # =================================================================
         print("\n" + "="*60)
@@ -1873,19 +1994,33 @@ class EvaluationRunner:
             f.write("TWIN ATTENTION MODEL - EVALUATION SUMMARY\n")
             f.write("="*50 + "\n\n")
 
+            f.write("PRIMARY RESULT: KNN CELL IDENTIFICATION\n")
+            f.write("="*50 + "\n")
+            f.write(f"Simulated Embryos: {knn_results['overall_accuracy']*100:.1f}%\n")
+            f.write(f"  95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]\n")
+            f.write(f"  Unique cells: {knn_results['unique_cells']}\n")
+            if 'real_embryo' in self.results:
+                real_res = self.results['real_embryo']
+                f.write(f"\nReal Embryos: {real_res['overall_accuracy']*100:.1f}%\n")
+                f.write(f"  95% CI: [{real_res['ci'][0]*100:.1f}%, {real_res['ci'][1]*100:.1f}%]\n")
+                f.write(f"  Unique cells: {real_res['unique_cells']}\n")
+            f.write("\n")
+
             f.write("SECTION 3.1: CORE PERFORMANCE\n")
             f.write("-"*30 + "\n")
-            f.write(f"Direct Matching Accuracy: {match_results['match_accuracy']*100:.1f}%\n")
-            f.write(f"Outlier Detection Accuracy: {match_results['outlier_accuracy']*100:.1f}%\n")
-            f.write(f"Overall Accuracy: {match_results['overall_accuracy']*100:.1f}%\n")
             f.write(f"KNN Identification Accuracy: {knn_results['overall_accuracy']*100:.1f}%\n")
-            f.write(f"  95% CI: [{knn_results['ci'][0]*100:.1f}%, {knn_results['ci'][1]*100:.1f}%]\n\n")
+            f.write(f"  Hierarchical:\n")
+            for k, v in knn_results['hierarchical'].items():
+                f.write(f"    {k}: {v*100:.1f}%\n")
+            f.write(f"\nMatching Accuracy (training objective): {match_results['match_accuracy']*100:.1f}%\n")
+            f.write(f"Outlier Detection Accuracy: {match_results['outlier_accuracy']*100:.1f}%\n\n")
 
-            f.write("SECTION 3.2: BASELINE COMPARISON\n")
+            f.write("SECTION 3.2: BASELINE COMPARISON (Identification)\n")
             f.write("-"*30 + "\n")
             for m, a in baselines.items():
                 f.write(f"{m.upper()}: {a*100:.1f}%\n")
-            f.write(f"TWIN ATTENTION (Ours): {match_results['match_accuracy']*100:.1f}%\n\n")
+            f.write(f"TWIN ATTENTION (Ours): {knn_results['overall_accuracy']*100:.1f}%\n")
+            f.write(f"Improvement over Siamese: +{(knn_results['overall_accuracy'] - baselines['siamese'])*100:.1f}pp\n\n")
 
             f.write("SECTION 3.3: ROBUSTNESS\n")
             f.write("-"*30 + "\n")
@@ -1895,6 +2030,18 @@ class EvaluationRunner:
             f.write("Coordinate noise:\n")
             for scale, acc in robust_results['noise'].items():
                 f.write(f"  {scale}x: {acc*100:.1f}%\n")
+
+            f.write("\nSECTIONS 3.4-3.5: ABLATIONS (Identification Accuracy)\n")
+            f.write("-"*30 + "\n")
+            f.write("Architecture:\n")
+            for name, acc in arch_ablations.items():
+                f.write(f"  {name}: {acc*100:.1f}%\n")
+            f.write("Features:\n")
+            for name, acc in feat_ablations.items():
+                f.write(f"  {name}: {acc*100:.1f}%\n")
+            f.write("Curriculum:\n")
+            for name, acc in curr_ablations.items():
+                f.write(f"  {name}: {acc*100:.1f}%\n")
 
         print(f"\nResults saved to: {self.config.OUTPUT_DIR}")
         print(f"Figures saved to: {self.config.FIGURE_DIR}")
