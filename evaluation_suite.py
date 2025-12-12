@@ -1172,9 +1172,12 @@ class AblationEvaluator:
         print(f"    Parameters: {n_params:,}")
 
         # Curriculum schedule (if enabled)
-        curriculum_schedule = {0: 0, 4: 1, 8: 2, 12: 3} if use_curriculum else {}
+        curriculum_schedule = {0: 0, 3: 1, 6: 2, 9: 3} if use_curriculum else {}
 
-        # Training loop
+        # Track training progress
+        epoch_history = []
+
+        # Training loop with epoch-by-epoch tracking
         for epoch in range(self.ablation_epochs):
             if train_ds is not None and use_curriculum:
                 for epoch_threshold, stage in curriculum_schedule.items():
@@ -1197,11 +1200,30 @@ class AblationEvaluator:
                 optimizer.step()
                 epoch_loss += loss.item()
 
-            if (epoch + 1) % 5 == 0:
-                print(f"    Epoch {epoch+1}/{self.ablation_epochs}: loss={epoch_loss/len(train_loader):.3f}")
+            avg_loss = epoch_loss / len(train_loader)
 
-        # KNN Identification evaluation
-        print(f"    Extracting embeddings for KNN...")
+            # Evaluate matching accuracy every epoch (fast)
+            model.eval()
+            match_correct, match_total = 0, 0
+            with torch.no_grad():
+                for batch in eval_loader:
+                    pc1, pc2, mask1, mask2, match_indices, _ = batch
+                    pc1, pc2 = pc1.to(device), pc2.to(device)
+                    mask1, mask2 = mask1.to(device), mask2.to(device)
+                    match_indices = match_indices.to(device)
+
+                    z1, z2, temp = model(pc1, pc2, mask1, mask2, epoch=100)
+                    _, metrics = loss_fn(z1, z2, match_indices, temp, mask1, mask2)
+                    match_correct += metrics['match_correct']
+                    match_total += metrics['match_total']
+
+            match_acc = match_correct / match_total if match_total > 0 else 0
+            epoch_history.append({'epoch': epoch+1, 'loss': avg_loss, 'match_acc': match_acc})
+
+            print(f"    Epoch {epoch+1}/{self.ablation_epochs}: loss={avg_loss:.3f}, match_acc={match_acc*100:.1f}%")
+
+        # Final KNN Identification evaluation
+        print(f"    Final KNN evaluation...")
         train_emb, train_labels = self.extract_embeddings(model, train_loader)
         test_emb, test_labels = self.extract_embeddings(model, eval_loader)
 
@@ -1217,6 +1239,9 @@ class AblationEvaluator:
         accuracy = np.mean(unique_correct)
 
         print(f"    KNN Identification Accuracy: {accuracy*100:.1f}%")
+        curve_str = " -> ".join([f"{h['match_acc']*100:.0f}%" for h in epoch_history])
+        print(f"    Training curve: {curve_str}")
+
         return accuracy
 
     def run_architecture_ablations(self):
