@@ -1276,102 +1276,269 @@ class EvaluationEngine:
         n_params = sum(p.numel() for p in self.model.parameters())
         print(f"  Loaded model with {n_params:,} parameters")
 
-    def build_reference_manifold(self, data_dict: Dict, max_samples: int = 50000):
+    def validate_data_coverage(self, data_dict: Dict, name: str = "Data"):
+        """
+        Validate that data covers all required developmental stages.
+
+        Checks:
+        - Which cell count stages (4-194) are present
+        - How many samples per stage
+        - Whether training pairs can be generated
+        """
+        print(f"\n{'='*60}")
+        print(f"DATA VALIDATION: {name}")
+        print(f"{'='*60}")
+
+        stage_counts = defaultdict(int)  # n_cells -> count of timepoints
+        embryo_stage_range = {}  # embryo -> (min_cells, max_cells)
+
+        for embryo_id, timepoints in data_dict.items():
+            min_cells = float('inf')
+            max_cells = 0
+            for t, cells in timepoints.items():
+                n_cells = len(cells)
+                stage_counts[n_cells] += 1
+                min_cells = min(min_cells, n_cells)
+                max_cells = max(max_cells, n_cells)
+            embryo_stage_range[embryo_id] = (min_cells, max_cells)
+
+        # Check coverage
+        all_stages = sorted(stage_counts.keys())
+        print(f"\nTotal embryos: {len(data_dict)}")
+        print(f"Total timepoints: {sum(stage_counts.values())}")
+        print(f"Cell count range: {min(all_stages)} - {max(all_stages)}")
+
+        # Check for gaps in coverage
+        expected_stages = set(range(4, 195))
+        covered_stages = set(all_stages)
+        missing_stages = expected_stages - covered_stages
+
+        if missing_stages:
+            print(f"\nWARNING: Missing {len(missing_stages)} stages!")
+            # Group consecutive missing stages
+            missing_list = sorted(missing_stages)
+            gaps = []
+            start = missing_list[0]
+            end = start
+            for s in missing_list[1:]:
+                if s == end + 1:
+                    end = s
+                else:
+                    gaps.append((start, end))
+                    start = s
+                    end = s
+            gaps.append((start, end))
+            for g_start, g_end in gaps[:10]:  # Show first 10 gaps
+                if g_start == g_end:
+                    print(f"  Missing: {g_start} cells")
+                else:
+                    print(f"  Missing: {g_start}-{g_end} cells")
+        else:
+            print(f"\nAll stages from 4-194 cells are covered!")
+
+        # Stage distribution
+        print(f"\nStage distribution (samples per 10-cell bin):")
+        for bin_start in range(0, 200, 20):
+            bin_end = bin_start + 20
+            bin_count = sum(stage_counts[s] for s in range(bin_start, bin_end) if s in stage_counts)
+            if bin_count > 0:
+                bar = '#' * min(50, bin_count // 10)
+                print(f"  {bin_start:3d}-{bin_end:3d} cells: {bin_count:5d} {bar}")
+
+        return stage_counts, missing_stages
+
+    def build_reference_manifold(self, data_dict: Dict, max_samples: int = 100000):
         """
         Build reference embedding manifold from training data.
 
-        For inference, we embed cells from training data using self-pairing
-        (passing the same neighborhood as both pc1 and pc2). This creates
-        a reference manifold that query cells can be matched against using k-NN.
+        Following the Twin Attention paper: embeddings are created by pairing
+        each training sample with a RANDOM stage-matched sample from training.
+        We keep the z1 (anchor) embeddings and discard z2.
 
         Args:
             data_dict: Training data dictionary
             max_samples: Maximum number of embeddings to store
         """
         print("Building reference embedding manifold...")
+        print("  (Using random pairing strategy from Twin Attention paper)")
 
         self.model.eval()
         embeddings_list = []
         labels_list = []
 
+        # Build stage-indexed samples for efficient pairing
+        stage_samples = defaultdict(list)  # stage (n_cells) -> list of (embryo_id, timepoint, cells)
+
+        for embryo_id, timepoints in data_dict.items():
+            for t, cells in timepoints.items():
+                n_cells = len(cells)
+                if 5 <= n_cells <= 194:
+                    stage_samples[n_cells].append((embryo_id, t, cells))
+
+        print(f"  Found {len(stage_samples)} distinct stages")
+        print(f"  Cell count range: {min(stage_samples.keys())} - {max(stage_samples.keys())}")
+
         sampler = ImprovedSampler(min_cells=5, max_cells=20)
 
-        # Process each embryo and timepoint
-        embryo_list = list(data_dict.keys())
+        # Process samples - take multiple samples per timepoint for better coverage
+        all_timepoints = []
+        for stage, samples in stage_samples.items():
+            all_timepoints.extend(samples)
+
+        random.shuffle(all_timepoints)
 
         with torch.no_grad():
-            for embryo_id in tqdm(embryo_list, desc="Processing embryos"):
-                timepoints = data_dict[embryo_id]
-
-                for t, cells in timepoints.items():
-                    if len(cells) < 5 or len(cells) > 194:
-                        continue
-
-                    # Sample cells
-                    cell_ids, coords = sampler.sample_cells(cells, strategy='mixed')
-
-                    if len(cell_ids) < 5:
-                        continue
-
-                    # Normalize coordinates
-                    coords = coords - coords.mean(axis=0)
-                    std = coords.std()
-                    if std > 0:
-                        coords = coords / std
-
-                    # Create tensors - SELF-PAIRING for embedding extraction
-                    # Pass same neighborhood as both pc1 and pc2
-                    pc = torch.from_numpy(coords).float().unsqueeze(0).to(self.device)
-
-                    # Forward pass with self-pairing
-                    z1, z2, _ = self.model(pc, pc)
-
-                    # Extract embeddings from z1 (or z2, they should be similar for self-pairs)
-                    if self.model.use_uncertainty:
-                        embeddings = z1[0].squeeze(0).cpu().numpy()  # (N, embed_dim)
-                    else:
-                        embeddings = z1.squeeze(0).cpu().numpy()
-
-                    # Store embeddings with their cell IDs
-                    for i, cell_id in enumerate(cell_ids):
-                        embeddings_list.append(embeddings[i])
-                        labels_list.append(cell_id)
-
-                # Check if we have enough samples
+            for embryo_id, t, cells in tqdm(all_timepoints, desc="Building manifold"):
                 if len(embeddings_list) >= max_samples:
                     break
+
+                n_cells = len(cells)
+
+                # Sample 5-20 cells from this timepoint (anchor)
+                cell_ids, coords = sampler.sample_cells(cells, strategy='mixed')
+                if len(cell_ids) < 5:
+                    continue
+
+                # Find a RANDOM stage-matched sample for pairing
+                # Stage matching: similar cell count (within a window)
+                stage_window = 10
+                possible_stages = [s for s in stage_samples.keys()
+                                   if abs(s - n_cells) <= stage_window]
+                if not possible_stages:
+                    possible_stages = [n_cells]
+
+                pair_stage = random.choice(possible_stages)
+                pair_samples = stage_samples.get(pair_stage, stage_samples[n_cells])
+
+                # Pick random sample, preferring different embryo
+                other_samples = [s for s in pair_samples if s[0] != embryo_id]
+                if other_samples:
+                    pair_embryo_id, pair_t, pair_cells = random.choice(other_samples)
+                else:
+                    pair_embryo_id, pair_t, pair_cells = random.choice(pair_samples)
+
+                # Sample 5-20 cells from pair
+                pair_cell_ids, pair_coords = sampler.sample_cells(pair_cells, strategy='mixed')
+                if len(pair_cell_ids) < 5:
+                    continue
+
+                # Normalize coordinates
+                coords_norm = coords - coords.mean(axis=0)
+                std = coords_norm.std()
+                if std > 0:
+                    coords_norm = coords_norm / std
+
+                pair_coords_norm = pair_coords - pair_coords.mean(axis=0)
+                pair_std = pair_coords_norm.std()
+                if pair_std > 0:
+                    pair_coords_norm = pair_coords_norm / pair_std
+
+                # Create tensors - anchor (pc1) and random pair (pc2)
+                pc1 = torch.from_numpy(coords_norm).float().unsqueeze(0).to(self.device)
+                pc2 = torch.from_numpy(pair_coords_norm).float().unsqueeze(0).to(self.device)
+
+                # Forward pass with random pairing
+                z1, z2, _ = self.model(pc1, pc2)
+
+                # Extract embeddings from z1 (anchor)
+                if self.model.use_uncertainty:
+                    embeddings = z1[0].squeeze(0).cpu().numpy()
+                else:
+                    embeddings = z1.squeeze(0).cpu().numpy()
+
+                # Store embeddings with their cell IDs
+                for i, cell_id in enumerate(cell_ids):
+                    embeddings_list.append(embeddings[i])
+                    labels_list.append(cell_id)
 
         self.reference_embeddings = np.array(embeddings_list)
         self.reference_labels = labels_list
 
+        # Print statistics
+        unique_labels = set(labels_list)
         print(f"  Built manifold with {len(self.reference_embeddings)} embeddings")
-        print(f"  Unique cell types: {len(set(self.reference_labels))}")
+        print(f"  Unique cell types: {len(unique_labels)}")
 
     def embed_query_neighborhood(
         self,
-        query_coords: np.ndarray
+        query_coords: np.ndarray,
+        query_cell_ids: List[str] = None
     ) -> np.ndarray:
         """
-        Embed a query neighborhood using self-pairing.
+        Embed a query neighborhood by pairing with a random stage-matched
+        training sample.
+
+        Following the Twin Attention paper:
+        "To create embeddings to represent an embryo post training we generate
+        a batch of size one by concatenating the query embryo with a random
+        stage matched embryo from the training data"
 
         Args:
             query_coords: Query cell coordinates (N x 3)
+            query_cell_ids: Optional query cell identifiers (for overlap-based pairing)
 
         Returns:
             Embeddings array (N x embed_dim)
         """
-        # Normalize coordinates
+        n_query = len(query_coords)
+
+        # Find a suitable pairing sample from training data
+        sampler = ImprovedSampler(min_cells=5, max_cells=20)
+
+        # Strategy: Try to find a sample with overlapping cell IDs if known,
+        # otherwise use stage-matched random sample
+        best_pair = None
+        best_overlap = 0
+
+        # Try a few random embryos to find good pairing
+        for _ in range(10):
+            embryo_id = random.choice(list(self.train_data.keys()))
+            timepoints = self.train_data[embryo_id]
+
+            for t, cells in timepoints.items():
+                # Stage matching: similar number of cells
+                if abs(len(cells) - n_query * 5) > 50:  # Rough stage match
+                    continue
+
+                if query_cell_ids is not None:
+                    # Check for overlapping cells
+                    overlap = len(set(query_cell_ids) & set(cells.keys()))
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_pair = (embryo_id, t, cells)
+                else:
+                    # Just use first reasonable match
+                    if best_pair is None:
+                        best_pair = (embryo_id, t, cells)
+
+        if best_pair is None:
+            # Fallback: random sample
+            embryo_id = random.choice(list(self.train_data.keys()))
+            t = random.choice(list(self.train_data[embryo_id].keys()))
+            best_pair = (embryo_id, t, self.train_data[embryo_id][t])
+
+        _, _, pair_cells = best_pair
+        pair_cell_ids, pair_coords = sampler.sample_cells(pair_cells, strategy='mixed')
+
+        # Normalize query coordinates
         coords = query_coords - query_coords.mean(axis=0)
         std = coords.std()
         if std > 0:
             coords = coords / std
 
-        # Create tensor
-        pc = torch.from_numpy(coords).float().unsqueeze(0).to(self.device)
+        # Normalize pair coordinates
+        pair_coords = pair_coords - pair_coords.mean(axis=0)
+        pair_std = pair_coords.std()
+        if pair_std > 0:
+            pair_coords = pair_coords / pair_std
 
-        # Forward pass with self-pairing
+        # Create tensors - query as pc1, training sample as pc2
+        pc1 = torch.from_numpy(coords).float().unsqueeze(0).to(self.device)
+        pc2 = torch.from_numpy(pair_coords).float().unsqueeze(0).to(self.device)
+
+        # Forward pass
         with torch.no_grad():
-            z1, z2, _ = self.model(pc, pc)
+            z1, z2, _ = self.model(pc1, pc2)
 
             if self.model.use_uncertainty:
                 embeddings = z1[0].squeeze(0).cpu().numpy()
@@ -1389,13 +1556,13 @@ class EvaluationEngine:
         Predict cell identities using k-NN in embedding space.
 
         This is the real-world inference pipeline:
-        1. Embed the query neighborhood using self-pairing
+        1. Embed the query neighborhood by pairing with training data
         2. Use k-NN to find similar cells in the reference manifold
         3. Majority vote among k neighbors determines the prediction
 
         Args:
             query_coords: Query cell coordinates (N x 3)
-            query_ids: Query cell identifiers (for result mapping)
+            query_ids: Query cell identifiers (ground truth for evaluation)
 
         Returns:
             Dictionary mapping query cell IDs to predicted identities
@@ -1408,8 +1575,8 @@ class EvaluationEngine:
 
         self.model.eval()
 
-        # Get query embeddings
-        query_embeddings = self.embed_query_neighborhood(query_coords)
+        # Get query embeddings - pass cell IDs for overlap-based pairing
+        query_embeddings = self.embed_query_neighborhood(query_coords, query_ids)
 
         # k-NN classification against reference manifold
         nn = NearestNeighbors(n_neighbors=self.k_neighbors, metric='cosine')
@@ -1418,12 +1585,15 @@ class EvaluationEngine:
         distances, indices = nn.kneighbors(query_embeddings)
 
         predictions = {}
+        prediction_distances = {}
         for i, query_id in enumerate(query_ids):
             # Majority vote among k neighbors
             neighbor_labels = [self.reference_labels[idx] for idx in indices[i]]
             label_counts = Counter(neighbor_labels)
             predicted_id = label_counts.most_common(1)[0][0]
             predictions[query_id] = predicted_id
+            # Store mean distance for confidence estimation
+            prediction_distances[query_id] = float(distances[i].mean())
 
         return predictions
 
@@ -1895,6 +2065,15 @@ class EvaluationEngine:
         print("="*60)
 
         self.load_data()
+
+        # Validate data quality
+        print("\n" + "-"*60)
+        print("DATA QUALITY VALIDATION")
+        print("-"*60)
+        self.validate_data_coverage(self.train_data, "Training Data")
+        self.validate_data_coverage(self.eval_data, "Evaluation Data")
+        self.validate_data_coverage(self.real_data, "Real Data")
+
         self.load_model()
         self.build_reference_manifold(self.train_data)
 
