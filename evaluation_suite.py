@@ -1280,8 +1280,9 @@ class EvaluationEngine:
         """
         Build reference embedding manifold from training data.
 
-        This creates the embedding space that query cells are matched against
-        using k-nearest neighbor classification.
+        For inference, we embed cells from training data using self-pairing
+        (passing the same neighborhood as both pc1 and pc2). This creates
+        a reference manifold that query cells can be matched against using k-NN.
 
         Args:
             data_dict: Training data dictionary
@@ -1318,24 +1319,25 @@ class EvaluationEngine:
                     if std > 0:
                         coords = coords / std
 
-                    # Create tensors
-                    pc1 = torch.from_numpy(coords).float().unsqueeze(0).to(self.device)
-                    pc2 = pc1.clone()  # Self-pairing for embedding extraction
+                    # Create tensors - SELF-PAIRING for embedding extraction
+                    # Pass same neighborhood as both pc1 and pc2
+                    pc = torch.from_numpy(coords).float().unsqueeze(0).to(self.device)
 
-                    # Forward pass
-                    z1, z2, _ = self.model(pc1, pc2)
+                    # Forward pass with self-pairing
+                    z1, z2, _ = self.model(pc, pc)
 
+                    # Extract embeddings from z1 (or z2, they should be similar for self-pairs)
                     if self.model.use_uncertainty:
-                        embeddings = z1[0].squeeze(0).cpu().numpy()
+                        embeddings = z1[0].squeeze(0).cpu().numpy()  # (N, embed_dim)
                     else:
                         embeddings = z1.squeeze(0).cpu().numpy()
 
-                    # Store embeddings
+                    # Store embeddings with their cell IDs
                     for i, cell_id in enumerate(cell_ids):
                         embeddings_list.append(embeddings[i])
                         labels_list.append(cell_id)
 
-                # Check if we have enough
+                # Check if we have enough samples
                 if len(embeddings_list) >= max_samples:
                     break
 
@@ -1343,20 +1345,57 @@ class EvaluationEngine:
         self.reference_labels = labels_list
 
         print(f"  Built manifold with {len(self.reference_embeddings)} embeddings")
+        print(f"  Unique cell types: {len(set(self.reference_labels))}")
+
+    def embed_query_neighborhood(
+        self,
+        query_coords: np.ndarray
+    ) -> np.ndarray:
+        """
+        Embed a query neighborhood using self-pairing.
+
+        Args:
+            query_coords: Query cell coordinates (N x 3)
+
+        Returns:
+            Embeddings array (N x embed_dim)
+        """
+        # Normalize coordinates
+        coords = query_coords - query_coords.mean(axis=0)
+        std = coords.std()
+        if std > 0:
+            coords = coords / std
+
+        # Create tensor
+        pc = torch.from_numpy(coords).float().unsqueeze(0).to(self.device)
+
+        # Forward pass with self-pairing
+        with torch.no_grad():
+            z1, z2, _ = self.model(pc, pc)
+
+            if self.model.use_uncertainty:
+                embeddings = z1[0].squeeze(0).cpu().numpy()
+            else:
+                embeddings = z1.squeeze(0).cpu().numpy()
+
+        return embeddings
 
     def predict_identities(
         self,
         query_coords: np.ndarray,
-        query_ids: List[str],
-        ref_coords: Optional[np.ndarray] = None
+        query_ids: List[str]
     ) -> Dict[str, str]:
         """
         Predict cell identities using k-NN in embedding space.
 
+        This is the real-world inference pipeline:
+        1. Embed the query neighborhood using self-pairing
+        2. Use k-NN to find similar cells in the reference manifold
+        3. Majority vote among k neighbors determines the prediction
+
         Args:
             query_coords: Query cell coordinates (N x 3)
-            query_ids: Query cell identifiers
-            ref_coords: Optional reference coordinates for pairing
+            query_ids: Query cell identifiers (for result mapping)
 
         Returns:
             Dictionary mapping query cell IDs to predicted identities
@@ -1364,45 +1403,15 @@ class EvaluationEngine:
         if len(query_coords) == 0:
             return {}
 
+        if self.reference_embeddings is None:
+            raise ValueError("Reference manifold not built. Call build_reference_manifold first.")
+
         self.model.eval()
 
-        # Normalize coordinates
-        coords = query_coords - query_coords.mean(axis=0)
-        std = coords.std()
-        if std > 0:
-            coords = coords / std
+        # Get query embeddings
+        query_embeddings = self.embed_query_neighborhood(query_coords)
 
-        # Create reference (use training sample if not provided)
-        if ref_coords is None:
-            # Random sample from training data
-            embryo_id = random.choice(list(self.train_data.keys()))
-            timepoints = self.train_data[embryo_id]
-            t = random.choice(list(timepoints.keys()))
-            cells = timepoints[t]
-
-            sampler = ImprovedSampler(min_cells=5, max_cells=20)
-            _, ref_coords = sampler.sample_cells(cells, strategy='mixed')
-
-        # Normalize reference
-        ref_coords = ref_coords - ref_coords.mean(axis=0)
-        ref_std = ref_coords.std()
-        if ref_std > 0:
-            ref_coords = ref_coords / ref_std
-
-        # Create tensors
-        pc1 = torch.from_numpy(coords).float().unsqueeze(0).to(self.device)
-        pc2 = torch.from_numpy(ref_coords).float().unsqueeze(0).to(self.device)
-
-        # Get embeddings
-        with torch.no_grad():
-            z1, z2, _ = self.model(pc1, pc2)
-
-            if self.model.use_uncertainty:
-                query_embeddings = z1[0].squeeze(0).cpu().numpy()
-            else:
-                query_embeddings = z1.squeeze(0).cpu().numpy()
-
-        # k-NN classification
+        # k-NN classification against reference manifold
         nn = NearestNeighbors(n_neighbors=self.k_neighbors, metric='cosine')
         nn.fit(self.reference_embeddings)
 
@@ -1424,7 +1433,13 @@ class EvaluationEngine:
         description: str = "Evaluating"
     ) -> Tuple[List[float], Dict[str, List[float]]]:
         """
-        Evaluate accuracy on a dataset.
+        Evaluate accuracy on a dataset using k-NN in embedding space.
+
+        For each embryo/timepoint:
+        1. Sample a 5-20 cell neighborhood
+        2. Embed it using self-pairing
+        3. Use k-NN to predict each cell's identity from reference manifold
+        4. Compare predictions to ground truth
 
         Args:
             data_dict: Data dictionary with embryo data
@@ -1455,7 +1470,7 @@ class EvaluationEngine:
                 if len(cell_ids) < 5:
                     continue
 
-                # Get predictions
+                # Get predictions using k-NN
                 predictions = self.predict_identities(coords, cell_ids)
 
                 # Evaluate
