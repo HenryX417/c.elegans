@@ -55,6 +55,136 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # =============================================================================
+# SIAMESE TRANSFORMER (for ablation studies)
+# =============================================================================
+class SiameseTransformer(nn.Module):
+    """
+    Siamese Transformer baseline - processes each neighborhood INDEPENDENTLY.
+
+    This is the key architectural comparison:
+    - Same capacity as Joint Attention model
+    - Same feature extraction
+    - BUT: No cross-neighborhood attention during encoding
+    - Comparison happens AFTER independent encoding via similarity
+
+    This demonstrates the importance of joint attention - without it,
+    the model cannot learn correspondence-dependent representations.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 3,
+        embed_dim: int = 128,
+        num_heads: int = 8,
+        num_layers: int = 6,
+        dropout: float = 0.1,
+        use_sparse_features: bool = True,
+        use_uncertainty: bool = True
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.use_sparse_features = use_sparse_features
+        self.use_uncertainty = use_uncertainty
+
+        # Feature extraction (shared between both branches)
+        if use_sparse_features:
+            self.sparse_features = SparsePointFeatures(embed_dim)
+            self.feature_projection = nn.Linear(embed_dim, embed_dim)
+        else:
+            self.point_embed = nn.Linear(input_dim, embed_dim)
+
+        # Positional encoding
+        self.pos_encoding = nn.Parameter(torch.randn(1, 50, embed_dim) * 0.02)
+
+        # SINGLE shared transformer encoder (Siamese = shared weights)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=False
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projections
+        if use_uncertainty:
+            self.output_mean = nn.Linear(embed_dim, embed_dim)
+            self.output_logvar = nn.Linear(embed_dim, embed_dim)
+        else:
+            self.output_proj = nn.Linear(embed_dim, embed_dim)
+
+        # Temperature
+        self.log_temperature = nn.Parameter(torch.tensor(0.0))
+
+    def encode_single(self, pc: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Encode a SINGLE point cloud independently.
+
+        This is the key difference from Joint Attention:
+        - Each neighborhood is processed in isolation
+        - No information about the comparison neighborhood
+        """
+        B, N, _ = pc.shape
+
+        # Extract features
+        if self.use_sparse_features:
+            z = self.sparse_features(pc, mask)
+            z = self.feature_projection(z)
+        else:
+            z = self.point_embed(pc)
+
+        # Add positional encoding
+        z = z + self.pos_encoding[:, :N, :]
+
+        # Create attention mask
+        if mask is not None:
+            attn_mask = ~mask.bool()
+        else:
+            attn_mask = None
+
+        # Transform INDEPENDENTLY
+        if attn_mask is not None:
+            z = self.transformer(z, src_key_padding_mask=attn_mask)
+        else:
+            z = self.transformer(z)
+
+        # Output projection with L2 normalization
+        if self.use_uncertainty:
+            z_mean = F.normalize(self.output_mean(z), p=2, dim=-1)
+            z_logvar = torch.clamp(self.output_logvar(z), -10, 2)
+            return (z_mean, z_logvar)
+        else:
+            z = F.normalize(self.output_proj(z), p=2, dim=-1)
+            return z
+
+    def forward(
+        self,
+        pc1: torch.Tensor,
+        pc2: torch.Tensor,
+        mask1: Optional[torch.Tensor] = None,
+        mask2: Optional[torch.Tensor] = None,
+        epoch: int = 0
+    ):
+        """
+        Forward pass - encode both neighborhoods INDEPENDENTLY.
+
+        Unlike Joint Attention which concatenates and processes together,
+        Siamese processes each neighborhood separately then compares.
+        """
+        # Encode each neighborhood independently (NO joint attention)
+        z1 = self.encode_single(pc1, mask1)
+        z2 = self.encode_single(pc2, mask2)
+
+        # Get temperature
+        temperature = torch.exp(self.log_temperature).clamp(0.01, 10.0)
+
+        return z1, z2, temperature
+
+
+# =============================================================================
 # DATA PATHS CONFIGURATION
 # =============================================================================
 class DataPaths:

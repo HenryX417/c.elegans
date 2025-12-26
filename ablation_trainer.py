@@ -44,10 +44,10 @@ from debug_sparse_matching import (
     set_seed,
     device
 )
-from evaluation_suite import (
+from evaluation_suite_fixed import (
     SiameseTransformer,
     DataPaths,
-    EvaluationEngine,
+    FixedEvaluationEngine as EvaluationEngine,
     StatisticalAnalysis
 )
 
