@@ -263,6 +263,28 @@ class CelegansLineage:
             return False
         return parent1.upper() == parent2.upper()
 
+    @staticmethod
+    def get_sublineage(cell_id: str, depth: int = 2) -> str:
+        """Extract sublineage at specified depth from founder."""
+        founder = CelegansLineage.get_founder(cell_id)
+        cell_upper = cell_id.upper()
+        if cell_upper.startswith(founder):
+            suffix = cell_id[len(founder):]
+        else:
+            suffix = ""
+        return founder + suffix[:depth]
+
+    @staticmethod
+    def same_sublineage(cell_id1: str, cell_id2: str, depth: int = 2) -> bool:
+        """Check if two cells share sublineage at given depth."""
+        return CelegansLineage.get_sublineage(cell_id1, depth).upper() == \
+               CelegansLineage.get_sublineage(cell_id2, depth).upper()
+
+    @staticmethod
+    def same_founder(cell_id1: str, cell_id2: str) -> bool:
+        """Check if two cells share founder lineage."""
+        return CelegansLineage.get_founder(cell_id1) == CelegansLineage.get_founder(cell_id2)
+
 
 # =============================================================================
 # RESULTS DATA STRUCTURES
@@ -1107,108 +1129,255 @@ class FixedEvaluationEngine:
     def evaluate_embryo_pairwise(
         self,
         embryo_data: Dict,
-        embryo_id: str
-    ) -> Tuple[float, int]:
+        embryo_id: str,
+        n_refs: int = 5
+    ) -> Tuple[float, int, Dict]:
         """
-        Evaluate embryo using pairwise matching (like training).
+        Evaluate embryo using pairwise matching with multi-reference voting.
 
-        This pairs query samples with training samples and uses
-        argmax on similarity matrix.
+        Uses multiple reference pairs and votes on predictions for stability.
         """
         sampler = ImprovedSampler(min_cells=5, max_cells=20)
 
         correct = 0
         total = 0
+        hierarchical = {'exact': 0, 'sublineage': 0, 'founder': 0, 'binary': 0}
+        by_size = {'sparse': {'correct': 0, 'total': 0},  # 5-10 cells
+                   'medium': {'correct': 0, 'total': 0},  # 11-15 cells
+                   'dense': {'correct': 0, 'total': 0}}   # 16-20 cells
 
         for t, cells in embryo_data.items():
             if len(cells) < 5:
                 continue
 
             cell_ids, coords = sampler.sample_cells(cells, strategy='mixed')
-            if len(cell_ids) < 5:
+            n_cells = len(cell_ids)
+            if n_cells < 5:
                 continue
+
+            # Determine size category
+            if n_cells <= 10:
+                size_cat = 'sparse'
+            elif n_cells <= 15:
+                size_cat = 'medium'
+            else:
+                size_cat = 'dense'
 
             embryo_stage = len(cells)
 
-            # Find overlapping reference
+            # Find multiple overlapping references for voting
             pairs = self.find_overlapping_pairs(
                 cell_ids, embryo_stage,
-                min_overlap=1, n_pairs=1
+                min_overlap=1, n_pairs=n_refs
             )
 
             if len(pairs) == 0:
                 continue
 
-            ref_ids, ref_coords = pairs[0]
-            predictions, _ = self.predict_pairwise(coords, cell_ids, ref_coords, ref_ids)
+            # Collect votes from multiple reference pairings
+            votes = defaultdict(list)  # query_id -> list of predicted ids
 
-            # Evaluate on overlapping cells
-            for query_id, pred_id in predictions.items():
-                if query_id in ref_ids:
-                    total += 1
-                    if query_id == pred_id:
-                        correct += 1
+            for ref_ids, ref_coords in pairs:
+                predictions, _ = self.predict_pairwise(coords, cell_ids, ref_coords, ref_ids)
+                for query_id, pred_id in predictions.items():
+                    if query_id in ref_ids:  # Only count when query exists in reference
+                        votes[query_id].append(pred_id)
+
+            # Use majority voting for final predictions
+            for query_id, pred_list in votes.items():
+                if len(pred_list) == 0:
+                    continue
+
+                # Majority vote
+                vote_counts = Counter(pred_list)
+                final_pred = vote_counts.most_common(1)[0][0]
+
+                total += 1
+                by_size[size_cat]['total'] += 1
+
+                # Exact match
+                is_correct = (query_id == final_pred)
+                if is_correct:
+                    correct += 1
+                    by_size[size_cat]['correct'] += 1
+                    hierarchical['exact'] += 1
+
+                # Hierarchical accuracy (even if not exact match)
+                if CelegansLineage.same_sublineage(query_id, final_pred):
+                    hierarchical['sublineage'] += 1
+                if CelegansLineage.same_founder(query_id, final_pred):
+                    hierarchical['founder'] += 1
+                # Binary: AB vs non-AB
+                query_is_ab = CelegansLineage.get_founder(query_id) == 'AB'
+                pred_is_ab = CelegansLineage.get_founder(final_pred) == 'AB'
+                if query_is_ab == pred_is_ab:
+                    hierarchical['binary'] += 1
 
         accuracy = correct / total if total > 0 else 0.0
-        return accuracy, total
 
-    def evaluate_simulated(self) -> Tuple[ConfidenceInterval, ConfidenceInterval]:
+        # Convert hierarchical to percentages
+        if total > 0:
+            for key in hierarchical:
+                hierarchical[key] = hierarchical[key] / total
+
+        # Convert by_size to accuracies
+        for size_cat in by_size:
+            if by_size[size_cat]['total'] > 0:
+                by_size[size_cat]['accuracy'] = by_size[size_cat]['correct'] / by_size[size_cat]['total']
+            else:
+                by_size[size_cat]['accuracy'] = 0.0
+
+        return accuracy, total, {'hierarchical': hierarchical, 'by_size': by_size}
+
+    def evaluate_simulated(self) -> Dict:
         """
         Evaluate on simulated (held-out) embryos.
 
         Returns:
-            Tuple of (knn_accuracy_ci, pairwise_accuracy_ci)
+            Dictionary with knn_ci, pairwise_ci, hierarchical, by_size
         """
         print("\nEvaluating on simulated data...")
 
         knn_accuracies = []
         pairwise_accuracies = []
 
+        # Aggregate hierarchical and by_size metrics
+        hierarchical_totals = {'exact': 0, 'sublineage': 0, 'founder': 0, 'binary': 0}
+        by_size_totals = {'sparse': {'correct': 0, 'total': 0},
+                          'medium': {'correct': 0, 'total': 0},
+                          'dense': {'correct': 0, 'total': 0}}
+        total_cells = 0
+
         for embryo_id, timepoints in tqdm(self.eval_data.items(), desc="Embryos"):
             knn_acc, knn_n, _ = self.evaluate_embryo_knn(timepoints, embryo_id)
-            pairwise_acc, pairwise_n = self.evaluate_embryo_pairwise(timepoints, embryo_id)
+            pairwise_acc, pairwise_n, details = self.evaluate_embryo_pairwise(timepoints, embryo_id)
 
             if knn_n > 0:
                 knn_accuracies.append(knn_acc)
             if pairwise_n > 0:
                 pairwise_accuracies.append(pairwise_acc)
 
+                # Aggregate hierarchical metrics (weighted by n cells)
+                for key in hierarchical_totals:
+                    hierarchical_totals[key] += details['hierarchical'][key] * pairwise_n
+                total_cells += pairwise_n
+
+                # Aggregate by_size
+                for size_cat in by_size_totals:
+                    by_size_totals[size_cat]['correct'] += details['by_size'][size_cat]['correct']
+                    by_size_totals[size_cat]['total'] += details['by_size'][size_cat]['total']
+
         knn_ci = StatisticalAnalysis.bootstrap_ci(knn_accuracies)
         pairwise_ci = StatisticalAnalysis.bootstrap_ci(pairwise_accuracies)
 
+        # Compute final hierarchical percentages
+        hierarchical_pct = {}
+        if total_cells > 0:
+            for key in hierarchical_totals:
+                hierarchical_pct[key] = 100 * hierarchical_totals[key] / total_cells
+        else:
+            hierarchical_pct = {k: 0.0 for k in hierarchical_totals}
+
+        # Compute final by_size accuracies
+        by_size_pct = {}
+        for size_cat in by_size_totals:
+            t = by_size_totals[size_cat]['total']
+            c = by_size_totals[size_cat]['correct']
+            by_size_pct[size_cat] = 100 * c / t if t > 0 else 0.0
+
         print(f"  k-NN accuracy: {knn_ci}")
         print(f"  Pairwise accuracy: {pairwise_ci}")
+        print(f"\n  Hierarchical Accuracy:")
+        print(f"    Exact: {hierarchical_pct['exact']:.1f}%")
+        print(f"    Sublineage: {hierarchical_pct['sublineage']:.1f}%")
+        print(f"    Founder: {hierarchical_pct['founder']:.1f}%")
+        print(f"    Binary (AB vs non-AB): {hierarchical_pct['binary']:.1f}%")
+        print(f"\n  Accuracy by Neighborhood Size:")
+        print(f"    Sparse (5-10 cells): {by_size_pct['sparse']:.1f}%")
+        print(f"    Medium (11-15 cells): {by_size_pct['medium']:.1f}%")
+        print(f"    Dense (16-20 cells): {by_size_pct['dense']:.1f}%")
 
-        return knn_ci, pairwise_ci
+        return {
+            'knn_ci': knn_ci,
+            'pairwise_ci': pairwise_ci,
+            'hierarchical': hierarchical_pct,
+            'by_size': by_size_pct
+        }
 
-    def evaluate_real(self) -> Tuple[ConfidenceInterval, ConfidenceInterval]:
+    def evaluate_real(self) -> Dict:
         """
         Evaluate on real embryo data.
 
         Returns:
-            Tuple of (knn_accuracy_ci, pairwise_accuracy_ci)
+            Dictionary with knn_ci, pairwise_ci, hierarchical, by_size
         """
         print("\nEvaluating on real data...")
 
         knn_accuracies = []
         pairwise_accuracies = []
 
+        # Aggregate hierarchical and by_size metrics
+        hierarchical_totals = {'exact': 0, 'sublineage': 0, 'founder': 0, 'binary': 0}
+        by_size_totals = {'sparse': {'correct': 0, 'total': 0},
+                          'medium': {'correct': 0, 'total': 0},
+                          'dense': {'correct': 0, 'total': 0}}
+        total_cells = 0
+
         for embryo_id, timepoints in tqdm(self.real_data.items(), desc="Embryos"):
             knn_acc, knn_n, _ = self.evaluate_embryo_knn(timepoints, embryo_id)
-            pairwise_acc, pairwise_n = self.evaluate_embryo_pairwise(timepoints, embryo_id)
+            pairwise_acc, pairwise_n, details = self.evaluate_embryo_pairwise(timepoints, embryo_id)
 
             if knn_n > 0:
                 knn_accuracies.append(knn_acc)
             if pairwise_n > 0:
                 pairwise_accuracies.append(pairwise_acc)
 
+                # Aggregate hierarchical metrics (weighted by n cells)
+                for key in hierarchical_totals:
+                    hierarchical_totals[key] += details['hierarchical'][key] * pairwise_n
+                total_cells += pairwise_n
+
+                # Aggregate by_size
+                for size_cat in by_size_totals:
+                    by_size_totals[size_cat]['correct'] += details['by_size'][size_cat]['correct']
+                    by_size_totals[size_cat]['total'] += details['by_size'][size_cat]['total']
+
         knn_ci = StatisticalAnalysis.bootstrap_ci(knn_accuracies)
         pairwise_ci = StatisticalAnalysis.bootstrap_ci(pairwise_accuracies)
 
+        # Compute final hierarchical percentages
+        hierarchical_pct = {}
+        if total_cells > 0:
+            for key in hierarchical_totals:
+                hierarchical_pct[key] = 100 * hierarchical_totals[key] / total_cells
+        else:
+            hierarchical_pct = {k: 0.0 for k in hierarchical_totals}
+
+        # Compute final by_size accuracies
+        by_size_pct = {}
+        for size_cat in by_size_totals:
+            t = by_size_totals[size_cat]['total']
+            c = by_size_totals[size_cat]['correct']
+            by_size_pct[size_cat] = 100 * c / t if t > 0 else 0.0
+
         print(f"  k-NN accuracy: {knn_ci}")
         print(f"  Pairwise accuracy: {pairwise_ci}")
+        print(f"\n  Hierarchical Accuracy:")
+        print(f"    Exact: {hierarchical_pct['exact']:.1f}%")
+        print(f"    Sublineage: {hierarchical_pct['sublineage']:.1f}%")
+        print(f"    Founder: {hierarchical_pct['founder']:.1f}%")
+        print(f"    Binary (AB vs non-AB): {hierarchical_pct['binary']:.1f}%")
+        print(f"\n  Accuracy by Neighborhood Size:")
+        print(f"    Sparse (5-10 cells): {by_size_pct['sparse']:.1f}%")
+        print(f"    Medium (11-15 cells): {by_size_pct['medium']:.1f}%")
+        print(f"    Dense (16-20 cells): {by_size_pct['dense']:.1f}%")
 
-        return knn_ci, pairwise_ci
+        return {
+            'knn_ci': knn_ci,
+            'pairwise_ci': pairwise_ci,
+            'hierarchical': hierarchical_pct,
+            'by_size': by_size_pct
+        }
 
     def evaluate_baselines(self) -> Dict[str, ConfidenceInterval]:
         """
@@ -1360,9 +1529,15 @@ class FixedEvaluationEngine:
         self.visualize_tsne(os.path.join(output_dir, "embedding_tsne.png"))
 
         # Evaluate
-        sim_knn, sim_pairwise = self.evaluate_simulated()
-        real_knn, real_pairwise = self.evaluate_real()
+        sim_results = self.evaluate_simulated()
+        real_results = self.evaluate_real()
         baseline_results = self.evaluate_baselines()
+
+        # Extract CIs
+        sim_knn = sim_results['knn_ci']
+        sim_pairwise = sim_results['pairwise_ci']
+        real_knn = real_results['knn_ci']
+        real_pairwise = real_results['pairwise_ci']
 
         # Summary
         print("\n" + "="*60)
@@ -1395,11 +1570,15 @@ class FixedEvaluationEngine:
         results = {
             'simulated': {
                 'knn': {'mean': sim_knn.mean, 'lower': sim_knn.lower, 'upper': sim_knn.upper},
-                'pairwise': {'mean': sim_pairwise.mean, 'lower': sim_pairwise.lower, 'upper': sim_pairwise.upper}
+                'pairwise': {'mean': sim_pairwise.mean, 'lower': sim_pairwise.lower, 'upper': sim_pairwise.upper},
+                'hierarchical': sim_results['hierarchical'],
+                'by_size': sim_results['by_size']
             },
             'real': {
                 'knn': {'mean': real_knn.mean, 'lower': real_knn.lower, 'upper': real_knn.upper},
-                'pairwise': {'mean': real_pairwise.mean, 'lower': real_pairwise.lower, 'upper': real_pairwise.upper}
+                'pairwise': {'mean': real_pairwise.mean, 'lower': real_pairwise.lower, 'upper': real_pairwise.upper},
+                'hierarchical': real_results['hierarchical'],
+                'by_size': real_results['by_size']
             },
             'baselines': {
                 name: {'mean': ci.mean, 'lower': ci.lower, 'upper': ci.upper}
