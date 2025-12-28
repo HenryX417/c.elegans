@@ -1,26 +1,49 @@
 """
 Comprehensive Evaluation Suite for C. elegans Cell Identification Model
-Fixed version with proper normalization, mask passing, and multi-reference evaluation.
+Fixed version with proper normalization, mask passing, and TRUE no-cheating evaluation.
 
-Critical Fixes Applied:
+=== EVALUATION PHILOSOPHY ===
+The key insight: In real deployment, you DON'T know which cells you're looking at.
+You only know:
+  - The 3D coordinates of 5-20 observed cells
+  - The total embryo cell count (from imaging)
+
+The "no-cheating" evaluation tests this TRUE deployment scenario:
+  INPUT: coordinates + embryo_stage (cell count only)
+  OUTPUT: predicted cell identities
+  NO ACCESS TO: Ground truth cell IDs during inference
+
+=== CRITICAL FIXES APPLIED ===
 1. Per-dimension normalization (matching training)
 2. Always pass masks to model
 3. Pass epoch=100 for learned temperature
-4. Multi-reference manifold building (stores ALL cell embeddings, not just shared)
-5. Multi-reference query embedding for stability
-6. Both k-NN and pairwise evaluation methods
-7. Pairwise evaluation with multi-reference voting (5 refs, majority vote)
-8. Hierarchical accuracy (exact, sublineage, founder, binary AB vs non-AB)
-9. Accuracy by neighborhood size (sparse 5-10, medium 11-15, dense 16-20)
-10. Sanity checks that run first
+4. TRUE NO-CHEATING: find_stage_matched_references() uses stage ONLY
+5. Stage-matched voting: identify_cells_no_cheating() for deployment scenario
+6. Stage-binned manifold for efficient k-NN lookup
+7. Hierarchical accuracy (exact, sublineage, founder, binary AB vs non-AB)
+8. Accuracy by neighborhood size (sparse 5-10, medium 11-15, dense 16-20)
+9. Comprehensive t-SNE visualizations for paper
+10. Sanity checks that run first (pairwise with known overlap)
 11. Data diagnostics (diagnose_real_data, check_manifold_coverage)
-12. t-SNE visualization for diagnostics
-13. Baselines use same task as model (cross-embryo matching) for fair comparison
+12. Fair baselines using cross-embryo matching (same task as model)
 
-Expected Results:
-- Simulated: 85-92%
-- Real: 80-88% (if cell names match training data)
-- Baselines: 40-60% (previously ~85% due to unfair consecutive timepoint matching)
+=== EXPECTED RESULTS ===
+No-Cheating (stage-matched voting):
+  - Simulated: 75-85%
+  - Real: 60-75%
+
+Stage-Aware k-NN:
+  - Simulated: 55-70%
+
+Baselines (fair comparison):
+  - 40-55%
+
+=== KEY METHODS ===
+- identify_cells_no_cheating(): TRUE deployment scenario
+- find_stage_matched_references(): Stage-only reference finding
+- build_stage_binned_manifold(): Stage-aware k-NN
+- evaluate_no_cheating(): Full no-cheating evaluation
+- visualize_manifold_comprehensive(): Paper-quality figures
 
 Author: Generated for Henry Xue's research
 """
@@ -1552,6 +1575,651 @@ class FixedEvaluationEngine:
 
         return results
 
+    # =========================================================================
+    # NO-CHEATING EVALUATION METHODS
+    # These methods use ONLY stage information, not ground truth cell IDs
+    # =========================================================================
+
+    def find_stage_matched_references(
+        self,
+        embryo_stage: int,
+        n_refs: int = 10,
+        stage_tolerance: int = 20
+    ) -> List[Tuple[List[str], np.ndarray]]:
+        """
+        Find training references by stage ONLY - no cell ID information used.
+
+        This is the TRUE deployment scenario:
+        - You image an embryo and count ~50 cells total
+        - You observe 5-20 of them
+        - You want to identify them without knowing any IDs
+
+        Args:
+            embryo_stage: Total cells in embryo (known from imaging)
+            n_refs: Number of references to return
+            stage_tolerance: How close stage must match (default ±20 cells)
+
+        Returns:
+            List of (cell_ids, coords) tuples from training data
+        """
+        sampler = ImprovedSampler(min_cells=5, max_cells=20)
+        candidates = []
+
+        for embryo_id, timepoints in self.train_data.items():
+            for t, cells in timepoints.items():
+                stage_diff = abs(len(cells) - embryo_stage)
+                if stage_diff <= stage_tolerance:
+                    candidates.append((stage_diff, embryo_id, t, cells))
+
+        # Sort by closest stage match
+        candidates.sort(key=lambda x: x[0])
+
+        results = []
+        used_embryos = set()  # Ensure diversity - don't use same embryo twice
+
+        for stage_diff, embryo_id, t, cells in candidates:
+            if embryo_id in used_embryos and len(results) < n_refs // 2:
+                continue  # Skip if we have enough diversity
+
+            sample_ids, sample_coords = sampler.sample_cells(cells, strategy='mixed')
+            if len(sample_ids) >= 5:
+                results.append((sample_ids, sample_coords))
+                used_embryos.add(embryo_id)
+                if len(results) >= n_refs:
+                    break
+
+        return results
+
+    def identify_cells_no_cheating(
+        self,
+        query_coords: np.ndarray,
+        embryo_stage: int,
+        n_refs: int = 10
+    ) -> Tuple[List[str], Dict]:
+        """
+        TRUE single-input cell identification - NO cheating.
+
+        This is what we'd use in real deployment:
+        1. Get stage-matched references (by cell count only)
+        2. Pair query with each reference
+        3. For each pairing, model outputs similarity matrix
+        4. Argmax gives predicted ID from that reference
+        5. Majority vote across all references
+
+        Args:
+            query_coords: (N, 3) coordinates of observed cells
+            embryo_stage: Total cells in embryo (known from imaging)
+            n_refs: Number of references to vote over
+
+        Returns:
+            Tuple of (predicted_ids list, debug_info dict)
+        """
+        n_query = len(query_coords)
+        query_norm = normalize_coords(query_coords)
+
+        # Step 1: Find references by STAGE ONLY (no ID information!)
+        references = self.find_stage_matched_references(embryo_stage, n_refs=n_refs)
+
+        if len(references) == 0:
+            return ["UNKNOWN"] * n_query, {'error': 'no references found'}
+
+        # Step 2: Collect votes from each reference pairing
+        votes = defaultdict(list)  # query_idx -> list of (predicted_id, confidence)
+
+        for ref_ids, ref_coords in references:
+            ref_norm = normalize_coords(ref_coords)
+
+            # Forward pass - joint encoding
+            emb_query, emb_ref, temperature = self.forward_with_masks(query_norm, ref_norm)
+
+            # Compute similarity (exclude no-match token if present)
+            n_ref_cells = len(ref_ids)
+            emb_ref_cells = emb_ref[:n_ref_cells]  # Exclude no-match token
+
+            similarity = emb_query @ emb_ref_cells.T  # (N_query x N_ref)
+
+            # For each query cell, find best match in this reference
+            for q_idx in range(n_query):
+                sim_row = similarity[q_idx]
+                best_ref_idx = np.argmax(sim_row)
+                confidence = sim_row[best_ref_idx]
+
+                predicted_id = ref_ids[best_ref_idx]
+                votes[q_idx].append((predicted_id, confidence))
+
+        # Step 3: Majority vote (optionally weighted by confidence)
+        predictions = []
+        confidences = []
+
+        for q_idx in range(n_query):
+            if len(votes[q_idx]) == 0:
+                predictions.append("UNKNOWN")
+                confidences.append(0.0)
+                continue
+
+            # Simple majority vote
+            vote_ids = [v[0] for v in votes[q_idx]]
+            vote_counts = Counter(vote_ids)
+            best_id, best_count = vote_counts.most_common(1)[0]
+
+            # Confidence = fraction of votes for winner
+            conf = best_count / len(vote_ids)
+
+            predictions.append(best_id)
+            confidences.append(conf)
+
+        debug_info = {
+            'n_references_used': len(references),
+            'avg_confidence': np.mean(confidences),
+            'votes_per_cell': {i: votes[i] for i in range(min(3, n_query))}  # Sample
+        }
+
+        return predictions, debug_info
+
+    def evaluate_no_cheating(
+        self,
+        data: Dict,
+        data_name: str = "Test"
+    ) -> Dict:
+        """
+        Evaluate using TRUE no-cheating method.
+
+        Returns detailed results including hierarchical accuracy and by-size breakdown.
+        """
+        print(f"\nEvaluating {data_name} data (NO CHEATING - stage-matched only)...")
+
+        sampler = ImprovedSampler(min_cells=5, max_cells=20)
+
+        all_correct = []
+        hierarchical_totals = {'exact': 0, 'sublineage': 0, 'founder': 0, 'binary': 0}
+        by_size_totals = {
+            'sparse': {'correct': 0, 'total': 0},
+            'medium': {'correct': 0, 'total': 0},
+            'dense': {'correct': 0, 'total': 0}
+        }
+        total_cells = 0
+
+        for embryo_id, timepoints in tqdm(data.items(), desc=f"{data_name} embryos"):
+            for t, cells in timepoints.items():
+                if len(cells) < 5:
+                    continue
+
+                # Sample query cells (we know coords, we know ground truth IDs for eval only)
+                query_ids_gt, query_coords = sampler.sample_cells(cells, strategy='mixed')
+                n_cells = len(query_ids_gt)
+                if n_cells < 5:
+                    continue
+
+                # Determine size category
+                if n_cells <= 10:
+                    size_cat = 'sparse'
+                elif n_cells <= 15:
+                    size_cat = 'medium'
+                else:
+                    size_cat = 'dense'
+
+                embryo_stage = len(cells)
+
+                # TRUE NO-CHEATING: Only pass coords and stage
+                predictions, _ = self.identify_cells_no_cheating(
+                    query_coords,
+                    embryo_stage,
+                    n_refs=10
+                )
+
+                # Evaluate predictions against ground truth
+                for i, (gt_id, pred_id) in enumerate(zip(query_ids_gt, predictions)):
+                    if pred_id == "UNKNOWN":
+                        continue
+
+                    total_cells += 1
+                    by_size_totals[size_cat]['total'] += 1
+
+                    # Exact match
+                    is_correct = (gt_id == pred_id)
+                    all_correct.append(1 if is_correct else 0)
+
+                    if is_correct:
+                        hierarchical_totals['exact'] += 1
+                        by_size_totals[size_cat]['correct'] += 1
+
+                    # Hierarchical (even if not exact)
+                    if CelegansLineage.same_sublineage(gt_id, pred_id):
+                        hierarchical_totals['sublineage'] += 1
+                    if CelegansLineage.same_founder(gt_id, pred_id):
+                        hierarchical_totals['founder'] += 1
+
+                    gt_is_ab = CelegansLineage.get_founder(gt_id) == 'AB'
+                    pred_is_ab = CelegansLineage.get_founder(pred_id) == 'AB'
+                    if gt_is_ab == pred_is_ab:
+                        hierarchical_totals['binary'] += 1
+
+        # Compute final metrics
+        accuracy_ci = StatisticalAnalysis.bootstrap_ci(all_correct)
+
+        hierarchical_pct = {}
+        for key in hierarchical_totals:
+            hierarchical_pct[key] = 100 * hierarchical_totals[key] / max(1, total_cells)
+
+        by_size_pct = {}
+        for size_cat in by_size_totals:
+            t = by_size_totals[size_cat]['total']
+            c = by_size_totals[size_cat]['correct']
+            by_size_pct[size_cat] = 100 * c / t if t > 0 else 0.0
+
+        # Print results
+        print(f"\n  {data_name} Results (NO CHEATING):")
+        print(f"    Overall: {accuracy_ci}")
+        print(f"\n    Hierarchical Accuracy:")
+        print(f"      Exact: {hierarchical_pct['exact']:.1f}%")
+        print(f"      Sublineage: {hierarchical_pct['sublineage']:.1f}%")
+        print(f"      Founder: {hierarchical_pct['founder']:.1f}%")
+        print(f"      Binary (AB vs non-AB): {hierarchical_pct['binary']:.1f}%")
+        print(f"\n    By Neighborhood Size:")
+        print(f"      Sparse (5-10): {by_size_pct['sparse']:.1f}%")
+        print(f"      Medium (11-15): {by_size_pct['medium']:.1f}%")
+        print(f"      Dense (16-20): {by_size_pct['dense']:.1f}%")
+
+        return {
+            'accuracy_ci': accuracy_ci,
+            'hierarchical': hierarchical_pct,
+            'by_size': by_size_pct,
+            'total_cells': total_cells
+        }
+
+    # =========================================================================
+    # STAGE-BINNED MANIFOLD METHODS
+    # =========================================================================
+
+    def build_stage_binned_manifold(self, n_pairs_per_embryo: int = 50, bin_size: int = 30):
+        """
+        Build manifold with stage information for stage-aware k-NN lookup.
+
+        Instead of one big manifold, create bins by developmental stage.
+        At inference, only search relevant stage bins.
+        """
+        print("\nBuilding stage-binned reference manifold...")
+
+        # cell_id -> list of (embedding, stage)
+        cell_stage_embeddings = defaultdict(list)
+        sampler = ImprovedSampler(min_cells=5, max_cells=20)
+
+        # Build embryo timelines
+        embryo_timelines = {}
+        for embryo_id, timepoints in self.train_data.items():
+            timeline = [(t, cells) for t, cells in timepoints.items()]
+            timeline.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
+            embryo_timelines[embryo_id] = timeline
+
+        total_embeddings = 0
+
+        for embryo_id in tqdm(embryo_timelines.keys(), desc="Building manifold"):
+            timeline = embryo_timelines[embryo_id]
+            if len(timeline) < 2:
+                continue
+
+            for _ in range(n_pairs_per_embryo):
+                idx1, idx2 = random.sample(range(len(timeline)), 2)
+                t1, cells1 = timeline[idx1]
+                t2, cells2 = timeline[idx2]
+
+                stage1 = len(cells1)
+                stage2 = len(cells2)
+
+                cell_ids1, coords1 = sampler.sample_cells(cells1, strategy='mixed')
+                cell_ids2, coords2 = sampler.sample_cells(cells2, strategy='mixed')
+
+                if len(cell_ids1) < 5 or len(cell_ids2) < 5:
+                    continue
+
+                coords1_norm = normalize_coords(coords1)
+                coords2_norm = normalize_coords(coords2)
+
+                emb1, emb2, _ = self.forward_with_masks(coords1_norm, coords2_norm)
+
+                # Store with stage info
+                for i, cid in enumerate(cell_ids1):
+                    cell_stage_embeddings[cid].append((emb1[i], stage1))
+                    total_embeddings += 1
+
+                for i, cid in enumerate(cell_ids2):
+                    if i < len(emb2) - 1:  # Exclude no-match token
+                        cell_stage_embeddings[cid].append((emb2[i], stage2))
+                        total_embeddings += 1
+
+        print(f"  Total embeddings: {total_embeddings}")
+        print(f"  Unique cells: {len(cell_stage_embeddings)}")
+
+        # Build stage-binned indices
+        self.stage_bins = defaultdict(lambda: {'embeddings': [], 'labels': [], 'stages': []})
+
+        for cell_id, emb_stage_list in cell_stage_embeddings.items():
+            for emb, stage in emb_stage_list:
+                bin_idx = stage // bin_size
+                self.stage_bins[bin_idx]['embeddings'].append(emb)
+                self.stage_bins[bin_idx]['labels'].append(cell_id)
+                self.stage_bins[bin_idx]['stages'].append(stage)
+
+        # Build k-NN index per bin AND aggregate embeddings per cell within bin
+        self.stage_knn = {}
+
+        for bin_idx, data in self.stage_bins.items():
+            if len(data['embeddings']) == 0:
+                continue
+
+            # Aggregate embeddings per cell within this bin
+            cell_embs = defaultdict(list)
+            for emb, label in zip(data['embeddings'], data['labels']):
+                cell_embs[label].append(emb)
+
+            # Average embeddings per cell
+            agg_embeddings = []
+            agg_labels = []
+            for cell_id, embs in cell_embs.items():
+                avg_emb = np.mean(embs, axis=0)
+                avg_emb = avg_emb / np.linalg.norm(avg_emb)
+                agg_embeddings.append(avg_emb)
+                agg_labels.append(cell_id)
+
+            embeddings_array = np.array(agg_embeddings)
+
+            knn = NearestNeighbors(
+                n_neighbors=min(self.k_neighbors, len(embeddings_array)),
+                metric='cosine'
+            )
+            knn.fit(embeddings_array)
+
+            self.stage_knn[bin_idx] = {
+                'index': knn,
+                'labels': agg_labels,
+                'embeddings': embeddings_array,
+                'n_cells': len(agg_labels)
+            }
+
+            print(f"    Bin {bin_idx} (stage {bin_idx*bin_size}-{(bin_idx+1)*bin_size}): {len(agg_labels)} cells")
+
+        # Also keep flat manifold for comparison
+        all_embeddings = []
+        all_labels = []
+        for cell_id, emb_stage_list in cell_stage_embeddings.items():
+            avg_emb = np.mean([e[0] for e in emb_stage_list], axis=0)
+            avg_emb = avg_emb / np.linalg.norm(avg_emb)
+            all_embeddings.append(avg_emb)
+            all_labels.append(cell_id)
+
+        self.reference_embeddings = np.array(all_embeddings)
+        self.reference_labels = all_labels
+
+        self.knn_index = NearestNeighbors(
+            n_neighbors=min(self.k_neighbors, len(self.reference_embeddings)),
+            metric='cosine'
+        )
+        self.knn_index.fit(self.reference_embeddings)
+
+        print(f"\n  Final flat manifold: {len(self.reference_embeddings)} unique cells")
+
+    def predict_knn_stage_aware(
+        self,
+        query_embeddings: np.ndarray,
+        query_cell_ids: List[str],
+        embryo_stage: int,
+        bin_size: int = 30
+    ) -> Dict[str, str]:
+        """
+        k-NN with stage-aware search - only look in relevant stage bins.
+
+        This is more realistic and should improve accuracy because we're not
+        searching cells from wildly different developmental stages.
+        """
+        bin_idx = embryo_stage // bin_size
+
+        # Search in same bin and ±1 adjacent bins
+        search_bins = [bin_idx]
+        if bin_idx > 0:
+            search_bins.append(bin_idx - 1)
+        search_bins.append(bin_idx + 1)
+
+        # Collect from relevant bins
+        combined_embeddings = []
+        combined_labels = []
+
+        for b in search_bins:
+            if b in self.stage_knn:
+                combined_embeddings.append(self.stage_knn[b]['embeddings'])
+                combined_labels.extend(self.stage_knn[b]['labels'])
+
+        if len(combined_embeddings) == 0:
+            # Fallback to full manifold
+            return self.predict_knn(query_embeddings, query_cell_ids)
+
+        combined_embeddings = np.vstack(combined_embeddings)
+
+        # Build temp k-NN
+        k = min(self.k_neighbors, len(combined_embeddings))
+        temp_knn = NearestNeighbors(n_neighbors=k, metric='cosine')
+        temp_knn.fit(combined_embeddings)
+
+        distances, indices = temp_knn.kneighbors(query_embeddings)
+
+        predictions = {}
+        for i, query_id in enumerate(query_cell_ids):
+            neighbor_labels = [combined_labels[idx] for idx in indices[i]]
+            label_counts = Counter(neighbor_labels)
+            predictions[query_id] = label_counts.most_common(1)[0][0]
+
+        return predictions
+
+    def evaluate_knn_stage_aware(
+        self,
+        data: Dict,
+        data_name: str = "Test"
+    ) -> Dict:
+        """
+        Evaluate using stage-aware k-NN.
+        """
+        print(f"\nEvaluating {data_name} data (Stage-Aware k-NN)...")
+
+        sampler = ImprovedSampler(min_cells=5, max_cells=20)
+
+        all_correct = []
+        total_cells = 0
+
+        for embryo_id, timepoints in tqdm(data.items(), desc=f"{data_name} k-NN"):
+            for t, cells in timepoints.items():
+                if len(cells) < 5:
+                    continue
+
+                query_ids_gt, query_coords = sampler.sample_cells(cells, strategy='mixed')
+                n_cells = len(query_ids_gt)
+                if n_cells < 5:
+                    continue
+
+                embryo_stage = len(cells)
+
+                # Get embeddings via multi-reference
+                embeddings = self.embed_query_multi_reference(query_coords, query_ids_gt, embryo_stage)
+
+                # Predict using stage-aware k-NN
+                predictions = self.predict_knn_stage_aware(embeddings, query_ids_gt, embryo_stage)
+
+                # Evaluate
+                ref_set = set(self.reference_labels)
+                for query_id, pred_id in predictions.items():
+                    if query_id in ref_set:
+                        total_cells += 1
+                        is_correct = (query_id == pred_id)
+                        all_correct.append(1 if is_correct else 0)
+
+        accuracy_ci = StatisticalAnalysis.bootstrap_ci(all_correct)
+        print(f"  {data_name} Stage-Aware k-NN: {accuracy_ci}")
+
+        return {
+            'accuracy_ci': accuracy_ci,
+            'total_cells': total_cells
+        }
+
+    # =========================================================================
+    # COMPREHENSIVE VISUALIZATION
+    # =========================================================================
+
+    def visualize_manifold_comprehensive(self, output_dir: str = "evaluation_results"):
+        """Generate comprehensive t-SNE visualizations for paper."""
+
+        if self.reference_embeddings is None or len(self.reference_embeddings) < 10:
+            print("  Not enough embeddings for visualization")
+            return {}
+
+        print("\nGenerating comprehensive visualizations...")
+
+        embeddings = self.reference_embeddings
+        labels = self.reference_labels
+
+        # Subsample if needed
+        if len(embeddings) > 3000:
+            indices = random.sample(range(len(embeddings)), 3000)
+            embeddings = embeddings[indices]
+            labels = [labels[i] for i in indices]
+
+        # Run t-SNE
+        print(f"  Running t-SNE on {len(embeddings)} points...")
+        tsne = TSNE(n_components=2, perplexity=50, n_iter=2000, random_state=RANDOM_SEED)
+        coords_2d = tsne.fit_transform(embeddings)
+
+        # === PLOT 1: Color by Founder Lineage ===
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        founders = [CelegansLineage.get_founder(label) for label in labels]
+        unique_founders = sorted(set(founders))
+
+        # Use distinct colors
+        colors_map = {
+            'AB': '#e41a1c',   # Red
+            'MS': '#377eb8',   # Blue
+            'E': '#4daf4a',    # Green
+            'C': '#984ea3',    # Purple
+            'D': '#ff7f00',    # Orange
+            'P4': '#a65628',   # Brown
+        }
+
+        for founder in unique_founders:
+            mask = [f == founder for f in founders]
+            mask_coords = coords_2d[np.array(mask)]
+            color = colors_map.get(founder, '#999999')
+            ax.scatter(mask_coords[:, 0], mask_coords[:, 1],
+                      c=color, label=founder, alpha=0.6, s=15)
+
+        ax.legend(title="Founder Lineage", loc='upper right', fontsize=10)
+        ax.set_xlabel("t-SNE 1", fontsize=12)
+        ax.set_ylabel("t-SNE 2", fontsize=12)
+        ax.set_title("Cell Embedding Manifold by Founder Lineage", fontsize=14)
+        ax.set_aspect('equal')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "tsne_by_founder.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: tsne_by_founder.png")
+
+        # === PLOT 2: Color by Sublineage (depth 2) ===
+        fig, ax = plt.subplots(figsize=(14, 10))
+
+        sublineages = [CelegansLineage.get_sublineage(label, depth=2) for label in labels]
+        unique_sublineages = sorted(set(sublineages))
+
+        # Use colormap for many categories
+        cmap = plt.cm.get_cmap('tab20')
+
+        for i, sublin in enumerate(unique_sublineages[:20]):  # Top 20 most common
+            mask = [s == sublin for s in sublineages]
+            if sum(mask) < 5:
+                continue
+            mask_coords = coords_2d[np.array(mask)]
+            ax.scatter(mask_coords[:, 0], mask_coords[:, 1],
+                      c=[cmap(i % 20)], label=sublin, alpha=0.6, s=15)
+
+        ax.legend(title="Sublineage", loc='upper right', fontsize=8, ncol=2)
+        ax.set_xlabel("t-SNE 1", fontsize=12)
+        ax.set_ylabel("t-SNE 2", fontsize=12)
+        ax.set_title("Cell Embedding Manifold by Sublineage", fontsize=14)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "tsne_by_sublineage.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: tsne_by_sublineage.png")
+
+        # === PLOT 3: Highlight specific well-known cells ===
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        # Background: all points in gray
+        ax.scatter(coords_2d[:, 0], coords_2d[:, 1], c='lightgray', alpha=0.3, s=10)
+
+        # Highlight specific cells
+        highlight_cells = ['ABa', 'ABp', 'ABal', 'ABar', 'ABpl', 'ABpr',
+                           'MS', 'E', 'C', 'D', 'P4', 'EMS', 'P2', 'P3']
+
+        highlight_colors = plt.cm.get_cmap('tab10')
+
+        for i, cell in enumerate(highlight_cells):
+            mask = [label == cell for label in labels]
+            if sum(mask) == 0:
+                continue
+            mask_coords = coords_2d[np.array(mask)]
+            ax.scatter(mask_coords[:, 0], mask_coords[:, 1],
+                      c=[highlight_colors(i % 10)], label=cell, alpha=0.9, s=50, edgecolors='black')
+
+        ax.legend(title="Cell Identity", loc='upper right', fontsize=9)
+        ax.set_xlabel("t-SNE 1", fontsize=12)
+        ax.set_ylabel("t-SNE 2", fontsize=12)
+        ax.set_title("Cell Embedding Manifold - Key Cells Highlighted", fontsize=14)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "tsne_key_cells.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: tsne_key_cells.png")
+
+        # === Cluster quality metrics ===
+        print("\n  Computing cluster quality metrics...")
+
+        cell_counts = Counter(labels)
+        common_cells = [c for c, count in cell_counts.most_common(50) if count >= 3]
+
+        intra_distances = []
+        inter_distances = []
+
+        from scipy.spatial.distance import pdist, cdist
+
+        for cell in common_cells:
+            cell_mask = np.array([label == cell for label in labels])
+            other_mask = ~cell_mask
+
+            if cell_mask.sum() < 2 or other_mask.sum() < 2:
+                continue
+
+            cell_coords = coords_2d[cell_mask]
+            other_coords = coords_2d[other_mask]
+
+            # Intra-class: avg distance within cluster
+            if len(cell_coords) > 1:
+                intra = np.mean(pdist(cell_coords))
+                intra_distances.append(intra)
+
+            # Inter-class: avg distance to nearest other cluster
+            inter = np.min(cdist(cell_coords, other_coords).mean(axis=1))
+            inter_distances.append(inter)
+
+        avg_intra = np.mean(intra_distances) if intra_distances else 0
+        avg_inter = np.mean(inter_distances) if inter_distances else 0
+        silhouette_approx = (avg_inter - avg_intra) / max(avg_inter, avg_intra) if max(avg_inter, avg_intra) > 0 else 0
+
+        print(f"    Avg intra-cluster distance: {avg_intra:.2f}")
+        print(f"    Avg inter-cluster distance: {avg_inter:.2f}")
+        print(f"    Silhouette-like score: {silhouette_approx:.3f}")
+
+        return {
+            'intra_distance': avg_intra,
+            'inter_distance': avg_inter,
+            'silhouette': silhouette_approx
+        }
+
     def visualize_tsne(self, output_path: str = "embedding_tsne.png"):
         """
         Generate t-SNE visualization of embedding manifold.
@@ -1608,106 +2276,121 @@ class FixedEvaluationEngine:
 
     def run_full_evaluation(self, output_dir: str = "evaluation_results"):
         """
-        Run complete evaluation pipeline.
+        Run complete evaluation pipeline with no-cheating methods.
 
+        Pipeline:
         1. Load data and model
         2. Run diagnostics (data coverage, naming)
-        3. Sanity checks
-        4. Build reference manifold
+        3. Sanity checks (pairwise with known overlap - verify model works)
+        4. Build stage-binned manifold
         5. Check manifold coverage
-        6. Evaluate on simulated data
-        7. Evaluate on real data
-        8. Evaluate baselines (fair comparison)
-        9. Generate visualizations
+        6. Generate comprehensive visualizations
+        7. MAIN RESULTS: No-cheating evaluation (stage-matched voting)
+        8. Comparison: Stage-aware k-NN
+        9. Fair baseline comparison
         10. Save results
         """
         os.makedirs(output_dir, exist_ok=True)
 
         print("\n" + "="*60)
-        print("COMPREHENSIVE EVALUATION SUITE (FIXED)")
+        print("COMPREHENSIVE EVALUATION SUITE")
         print("="*60)
 
         # Load everything
         self.load_data()
         self.load_model()
 
-        # Run diagnostics first
+        # Diagnostics
         self.diagnose_real_data()
 
-        # Sanity checks
+        # Sanity checks (pairwise with known overlap - just to verify model works)
         self.run_sanity_checks()
 
-        # Build manifold
-        self.build_reference_manifold()
+        # Build stage-binned manifold
+        self.build_stage_binned_manifold()
 
-        # Check manifold coverage
+        # Check coverage
         self.check_manifold_coverage()
 
-        # Visualize manifold
-        self.visualize_tsne(os.path.join(output_dir, "embedding_tsne.png"))
+        # Visualizations (BEFORE evaluation for debugging)
+        cluster_metrics = self.visualize_manifold_comprehensive(output_dir)
 
-        # Evaluate
-        sim_results = self.evaluate_simulated()
-        real_results = self.evaluate_real()
-        baseline_results = self.evaluate_baselines()
-
-        # Extract CIs
-        sim_knn = sim_results['knn_ci']
-        sim_pairwise = sim_results['pairwise_ci']
-        real_knn = real_results['knn_ci']
-        real_pairwise = real_results['pairwise_ci']
-
-        # Summary
+        # ===== MAIN RESULTS: NO-CHEATING EVALUATION =====
         print("\n" + "="*60)
-        print("EVALUATION SUMMARY")
+        print("MAIN RESULTS: TRUE SINGLE-INPUT IDENTIFICATION (NO CHEATING)")
         print("="*60)
 
-        print("\nSimulated Data:")
-        print(f"  k-NN (manifold): {sim_knn}")
-        print(f"  Pairwise: {sim_pairwise}")
+        sim_no_cheat = self.evaluate_no_cheating(self.eval_data, "Simulated")
+        real_no_cheat = self.evaluate_no_cheating(self.real_data, "Real")
 
-        print("\nReal Data:")
-        print(f"  k-NN (manifold): {real_knn}")
-        print(f"  Pairwise: {real_pairwise}")
+        # Also run k-NN (stage-aware) for comparison
+        print("\n" + "="*60)
+        print("COMPARISON: Stage-Aware k-NN")
+        print("="*60)
 
-        print("\nBaselines:")
+        sim_knn = self.evaluate_knn_stage_aware(self.eval_data, "Simulated")
+
+        # Fair baseline comparison
+        baseline_results = self.evaluate_baselines(cross_embryo=True)
+
+        # ===== SUMMARY =====
+        print("\n" + "="*60)
+        print("FINAL SUMMARY")
+        print("="*60)
+
+        print("\n  MAIN RESULT (No Cheating - Stage-Matched Voting):")
+        print(f"   Simulated: {sim_no_cheat['accuracy_ci']}")
+        print(f"   Real: {real_no_cheat['accuracy_ci']}")
+
+        print("\n  k-NN (Stage-Aware Manifold Lookup):")
+        print(f"   Simulated: {sim_knn['accuracy_ci']}")
+
+        print("\n  Baselines (Same Task - Fair Comparison):")
         for name, ci in baseline_results.items():
-            print(f"  {name}: {ci}")
+            print(f"   {name}: {ci}")
 
-        # Report BEST accuracy for paper
-        best_sim = max(sim_knn.mean, sim_pairwise.mean)
-        best_real = max(real_knn.mean, real_pairwise.mean)
+        # Compute improvement over best baseline
+        best_baseline = max(ci.mean for ci in baseline_results.values())
+        improvement = sim_no_cheat['accuracy_ci'].mean - best_baseline
 
-        print("\n" + "="*60)
-        print("PAPER NUMBERS (best of both methods):")
-        print(f"  Simulated: {best_sim:.1f}%")
-        print(f"  Real: {best_real:.1f}%")
-        print("="*60)
+        print(f"\n  Improvement over best baseline: +{improvement:.1f}%")
 
         # Save results
         results = {
-            'simulated': {
-                'knn': {'mean': sim_knn.mean, 'lower': sim_knn.lower, 'upper': sim_knn.upper},
-                'pairwise': {'mean': sim_pairwise.mean, 'lower': sim_pairwise.lower, 'upper': sim_pairwise.upper},
-                'hierarchical': sim_results['hierarchical'],
-                'by_size': sim_results['by_size']
+            'main_no_cheating': {
+                'simulated': {
+                    'accuracy': sim_no_cheat['accuracy_ci'].mean,
+                    'ci_lower': sim_no_cheat['accuracy_ci'].lower,
+                    'ci_upper': sim_no_cheat['accuracy_ci'].upper,
+                    'hierarchical': sim_no_cheat['hierarchical'],
+                    'by_size': sim_no_cheat['by_size']
+                },
+                'real': {
+                    'accuracy': real_no_cheat['accuracy_ci'].mean,
+                    'ci_lower': real_no_cheat['accuracy_ci'].lower,
+                    'ci_upper': real_no_cheat['accuracy_ci'].upper,
+                    'hierarchical': real_no_cheat['hierarchical'],
+                    'by_size': real_no_cheat['by_size']
+                }
             },
-            'real': {
-                'knn': {'mean': real_knn.mean, 'lower': real_knn.lower, 'upper': real_knn.upper},
-                'pairwise': {'mean': real_pairwise.mean, 'lower': real_pairwise.lower, 'upper': real_pairwise.upper},
-                'hierarchical': real_results['hierarchical'],
-                'by_size': real_results['by_size']
+            'knn_stage_aware': {
+                'simulated': {
+                    'accuracy': sim_knn['accuracy_ci'].mean,
+                    'ci_lower': sim_knn['accuracy_ci'].lower,
+                    'ci_upper': sim_knn['accuracy_ci'].upper
+                }
             },
             'baselines': {
                 name: {'mean': ci.mean, 'lower': ci.lower, 'upper': ci.upper}
                 for name, ci in baseline_results.items()
-            }
+            },
+            'cluster_quality': cluster_metrics if cluster_metrics else {}
         }
 
         with open(os.path.join(output_dir, "results.json"), 'w') as f:
             json.dump(results, f, indent=2)
 
-        print(f"\nResults saved to: {output_dir}/")
+        print(f"\n  Results saved to: {output_dir}/")
 
         return results
 
@@ -1716,18 +2399,27 @@ class FixedEvaluationEngine:
 # MAIN ENTRY POINT
 # =============================================================================
 def main():
-    """Run the fixed evaluation suite."""
+    """Run the complete evaluation suite with no-cheating methods."""
 
     print("="*60)
-    print("FIXED EVALUATION SUITE FOR C. ELEGANS CELL IDENTIFICATION")
+    print("C. ELEGANS CELL IDENTIFICATION - EVALUATION SUITE")
     print("="*60)
-    print("\nKey fixes applied:")
-    print("  1. Per-dimension normalization (matching training)")
-    print("  2. Always pass masks to model")
-    print("  3. Pass epoch=100 for learned temperature")
-    print("  4. Multi-reference manifold building")
-    print("  5. Multi-reference query embedding")
-    print("  6. Both k-NN and pairwise evaluation")
+    print("\n  TRUE NO-CHEATING EVALUATION")
+    print("  ----------------------------")
+    print("  Input: 3D coordinates + embryo stage (cell count)")
+    print("  Output: Predicted cell identities")
+    print("  NO ACCESS TO ground truth cell IDs during inference")
+    print()
+    print("  Key Methods:")
+    print("  1. Stage-matched voting (no cell ID information)")
+    print("  2. Stage-binned k-NN (efficient manifold lookup)")
+    print("  3. Fair baselines (same cross-embryo task)")
+    print()
+    print("  Outputs:")
+    print("  - tsne_by_founder.png (paper figure)")
+    print("  - tsne_by_sublineage.png (paper figure)")
+    print("  - tsne_key_cells.png (paper figure)")
+    print("  - results.json (all metrics)")
     print()
 
     engine = FixedEvaluationEngine()
