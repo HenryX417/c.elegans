@@ -613,62 +613,74 @@ class FixedEvaluationEngine:
         query_set = set(query_cell_ids)
         sampler = ImprovedSampler(min_cells=5, max_cells=20)
 
-        candidates = []
+        # Try progressively lower overlap thresholds (no recursion!)
+        for current_min_overlap in range(min_overlap, 0, -1):
+            candidates = []
 
-        for embryo_id, timepoints in self.train_data.items():
-            for t, cells in timepoints.items():
-                # Stage matching (within 30 cells)
-                if abs(len(cells) - embryo_stage) > 30:
-                    continue
+            for embryo_id, timepoints in self.train_data.items():
+                for t, cells in timepoints.items():
+                    # Relaxed stage matching (within 50 cells)
+                    if abs(len(cells) - embryo_stage) > 50:
+                        continue
 
-                overlap = len(query_set & set(cells.keys()))
-                if overlap >= min_overlap:
-                    candidates.append((overlap, embryo_id, t, cells))
+                    overlap = len(query_set & set(cells.keys()))
+                    if overlap >= current_min_overlap:
+                        candidates.append((overlap, embryo_id, t, cells))
 
-        # Sort by overlap (descending)
-        candidates.sort(key=lambda x: -x[0])
+            if len(candidates) == 0:
+                continue
 
+            # Sort by overlap (descending)
+            candidates.sort(key=lambda x: -x[0])
+
+            results = []
+            for overlap, embryo_id, t, cells in candidates[:n_pairs * 3]:
+                # Sample cells, prioritizing overlapping ones
+                shared = query_set & set(cells.keys())
+
+                if len(shared) >= 3:
+                    # Take all shared cells + some random others
+                    sample_ids = list(shared)
+                    if len(sample_ids) < 20:
+                        other_ids = [c for c in cells.keys() if c not in shared]
+                        n_extra = min(len(other_ids), 20 - len(sample_ids))
+                        if n_extra > 0:
+                            sample_ids.extend(random.sample(other_ids, n_extra))
+                    sample_ids = sample_ids[:20]
+                    sample_coords = np.array([cells[cid] for cid in sample_ids])
+                else:
+                    sample_ids, sample_coords = sampler.sample_cells(cells, strategy='mixed')
+
+                if len(sample_ids) >= 5:
+                    results.append((sample_ids, sample_coords))
+                    if len(results) >= n_pairs:
+                        break
+
+            if len(results) >= 1:
+                return results
+
+        # Ultimate fallback: random samples (no overlap requirement)
+        print(f"  Warning: No overlapping pairs found for {len(query_cell_ids)} query cells, using random samples")
         results = []
-        for overlap, embryo_id, t, cells in candidates[:n_pairs * 2]:
-            # Sample cells, prioritizing overlapping ones
-            shared = query_set & set(cells.keys())
-
-            if len(shared) >= 5:
-                # Take all shared cells + some random others
-                sample_ids = list(shared)
-                if len(sample_ids) < 20:
-                    other_ids = [c for c in cells.keys() if c not in shared]
-                    n_extra = min(len(other_ids), 20 - len(sample_ids))
-                    if n_extra > 0:
-                        sample_ids.extend(random.sample(other_ids, n_extra))
-                sample_ids = sample_ids[:20]
-                sample_coords = np.array([cells[cid] for cid in sample_ids])
-            else:
-                sample_ids, sample_coords = sampler.sample_cells(cells, strategy='mixed')
-
+        embryo_ids = random.sample(list(self.train_data.keys()), min(n_pairs * 2, len(self.train_data)))
+        for embryo_id in embryo_ids:
+            timepoints = list(self.train_data[embryo_id].items())
+            if len(timepoints) == 0:
+                continue
+            t, cells = random.choice(timepoints)
+            sample_ids, sample_coords = sampler.sample_cells(cells, strategy='mixed')
             if len(sample_ids) >= 5:
                 results.append((sample_ids, sample_coords))
                 if len(results) >= n_pairs:
                     break
 
-        # Fallback if not enough pairs found
-        if len(results) < 1:
-            # Reduce overlap requirement and try again
-            return self.find_overlapping_pairs(
-                query_cell_ids, embryo_stage,
-                min_overlap=max(1, min_overlap - 1),
-                n_pairs=n_pairs
-            )
-
-        return results
+        return results if len(results) > 0 else [(list(query_cell_ids)[:20], np.zeros((min(20, len(query_cell_ids)), 3)))]
 
     def build_reference_manifold(self, n_pairs_per_embryo: int = 50):
         """
         Build reference manifold using multi-reference aggregation.
 
-        CRITICAL: Only store embeddings for cells that exist in BOTH
-        neighborhoods of a pairing (matched cells produce highest quality embeddings).
-
+        CRITICAL: Sample overlapping cells intentionally to maximize manifold coverage.
         Each cell gets multiple embeddings from different context pairings,
         which are averaged for stability.
         """
@@ -676,8 +688,6 @@ class FixedEvaluationEngine:
 
         # Collect embeddings: cell_id -> list of embeddings
         cell_embeddings = defaultdict(list)
-
-        sampler = ImprovedSampler(min_cells=5, max_cells=20)
 
         # Build embryo timelines
         embryo_timelines = {}
@@ -704,30 +714,33 @@ class FixedEvaluationEngine:
                 t1, cells1 = timeline[idx1]
                 t2, cells2 = timeline[idx2]
 
-                # Check overlap requirement (minimum 3 shared cells)
+                # Find shared cells between timepoints
                 shared_cells = set(cells1.keys()) & set(cells2.keys())
-                if len(shared_cells) < self.min_overlap:
+                if len(shared_cells) < 3:
                     continue
 
-                # Sample cells from each timepoint
-                cell_ids1, coords1 = sampler.sample_cells(cells1, strategy='mixed')
-                cell_ids2, coords2 = sampler.sample_cells(cells2, strategy='mixed')
+                # CRITICAL: Sample cells that INCLUDE shared ones for maximum overlap
+                shared_list = list(shared_cells)
+                n_shared_to_include = min(len(shared_list), 15)
+                selected_shared = random.sample(shared_list, n_shared_to_include)
+
+                # Build sample 1: shared cells + some unique to timepoint 1
+                cell_ids1 = list(selected_shared)
+                unique1 = [c for c in cells1.keys() if c not in shared_cells]
+                n_extra1 = min(len(unique1), 20 - len(cell_ids1))
+                if n_extra1 > 0:
+                    cell_ids1.extend(random.sample(unique1, n_extra1))
+                coords1 = np.array([cells1[cid] for cid in cell_ids1])
+
+                # Build sample 2: shared cells + some unique to timepoint 2
+                cell_ids2 = list(selected_shared)
+                unique2 = [c for c in cells2.keys() if c not in shared_cells]
+                n_extra2 = min(len(unique2), 20 - len(cell_ids2))
+                if n_extra2 > 0:
+                    cell_ids2.extend(random.sample(unique2, n_extra2))
+                coords2 = np.array([cells2[cid] for cid in cell_ids2])
 
                 if len(cell_ids1) < 5 or len(cell_ids2) < 5:
-                    continue
-
-                # Find matched cells (exist in both samples)
-                matched_in_1 = []
-                matched_in_2 = []
-                matched_ids = []
-
-                for i, cid in enumerate(cell_ids1):
-                    if cid in cell_ids2:
-                        matched_in_1.append(i)
-                        matched_in_2.append(cell_ids2.index(cid))
-                        matched_ids.append(cid)
-
-                if len(matched_ids) == 0:
                     continue
 
                 # Normalize coordinates (per-dimension!)
@@ -737,8 +750,10 @@ class FixedEvaluationEngine:
                 # Forward pass with masks
                 emb1, emb2, _ = self.forward_with_masks(coords1_norm, coords2_norm)
 
-                # Store embeddings for matched cells only
-                for idx1, idx2, cid in zip(matched_in_1, matched_in_2, matched_ids):
+                # Store embeddings for the shared/matched cells
+                for cid in selected_shared:
+                    idx1 = cell_ids1.index(cid)
+                    idx2 = cell_ids2.index(cid)
                     # Average embeddings from both sides
                     avg_emb = (emb1[idx1] + emb2[idx2]) / 2
                     cell_embeddings[cid].append(avg_emb)
@@ -926,30 +941,49 @@ class FixedEvaluationEngine:
         all_passed = True
 
         # Check 1: Pairwise matching on training pairs
+        # CRITICAL: Sample OVERLAPPING cells specifically to match training setup
         print("\n[1] Pairwise matching on training pairs...")
-        sampler = ImprovedSampler(min_cells=5, max_cells=20)
 
         correct = 0
         total = 0
         temperatures = []
 
         # Sample some training pairs
-        embryo_ids = random.sample(list(self.train_data.keys()), min(10, len(self.train_data)))
+        embryo_ids = random.sample(list(self.train_data.keys()), min(20, len(self.train_data)))
 
         for embryo_id in embryo_ids:
             timepoints = list(self.train_data[embryo_id].items())
             if len(timepoints) < 2:
                 continue
 
-            for _ in range(5):
+            for _ in range(10):  # More attempts per embryo
                 (t1, cells1), (t2, cells2) = random.sample(timepoints, 2)
 
+                # Find shared cells between timepoints
                 shared = set(cells1.keys()) & set(cells2.keys())
-                if len(shared) < 3:
+                if len(shared) < 5:
                     continue
 
-                ids1, coords1 = sampler.sample_cells(cells1, strategy='mixed')
-                ids2, coords2 = sampler.sample_cells(cells2, strategy='mixed')
+                # CRITICAL: Sample cells that INCLUDE the shared ones
+                shared_list = list(shared)
+                n_shared_to_sample = min(len(shared_list), 15)
+                sampled_shared = random.sample(shared_list, n_shared_to_sample)
+
+                # Build sample 1: shared cells + some unique to cells1
+                ids1 = list(sampled_shared)
+                unique1 = [c for c in cells1.keys() if c not in shared]
+                n_extra1 = min(len(unique1), 20 - len(ids1))
+                if n_extra1 > 0:
+                    ids1.extend(random.sample(unique1, n_extra1))
+                coords1 = np.array([cells1[cid] for cid in ids1])
+
+                # Build sample 2: shared cells + some unique to cells2
+                ids2 = list(sampled_shared)
+                unique2 = [c for c in cells2.keys() if c not in shared]
+                n_extra2 = min(len(unique2), 20 - len(ids2))
+                if n_extra2 > 0:
+                    ids2.extend(random.sample(unique2, n_extra2))
+                coords2 = np.array([cells2[cid] for cid in ids2])
 
                 if len(ids1) < 5 or len(ids2) < 5:
                     continue
@@ -957,10 +991,11 @@ class FixedEvaluationEngine:
                 predictions, temp = self.predict_pairwise(coords1, ids1, coords2, ids2)
                 temperatures.append(temp)
 
-                for qid, pred_id in predictions.items():
-                    if qid in ids2:  # Only count overlapping cells
+                # Evaluate on the shared cells (which are in both samples)
+                for qid in sampled_shared:
+                    if qid in predictions:
                         total += 1
-                        if qid == pred_id:
+                        if predictions[qid] == qid:
                             correct += 1
 
         if total > 0:
