@@ -6,12 +6,21 @@ Critical Fixes Applied:
 1. Per-dimension normalization (matching training)
 2. Always pass masks to model
 3. Pass epoch=100 for learned temperature
-4. Multi-reference manifold building (only matched cell embeddings)
+4. Multi-reference manifold building (stores ALL cell embeddings, not just shared)
 5. Multi-reference query embedding for stability
 6. Both k-NN and pairwise evaluation methods
-7. Sanity checks that run first
-8. t-SNE visualization for diagnostics
-9. Baselines use no model components
+7. Pairwise evaluation with multi-reference voting (5 refs, majority vote)
+8. Hierarchical accuracy (exact, sublineage, founder, binary AB vs non-AB)
+9. Accuracy by neighborhood size (sparse 5-10, medium 11-15, dense 16-20)
+10. Sanity checks that run first
+11. Data diagnostics (diagnose_real_data, check_manifold_coverage)
+12. t-SNE visualization for diagnostics
+13. Baselines use same task as model (cross-embryo matching) for fair comparison
+
+Expected Results:
+- Simulated: 85-92%
+- Real: 80-88% (if cell names match training data)
+- Baselines: 40-60% (previously ~85% due to unfair consecutive timepoint matching)
 
 Author: Generated for Henry Xue's research
 """
@@ -567,6 +576,70 @@ class FixedEvaluationEngine:
         n_params = sum(p.numel() for p in self.model.parameters())
         print(f"  Loaded model with {n_params:,} parameters")
 
+    def diagnose_real_data(self):
+        """Check if real embryo cell names match training data"""
+        train_cells = set()
+        for embryo in self.train_data.values():
+            for cells in embryo.values():
+                train_cells.update(cells.keys())
+
+        eval_cells = set()
+        for embryo in self.eval_data.values():
+            for cells in embryo.values():
+                eval_cells.update(cells.keys())
+
+        real_cells = set()
+        for embryo in self.real_data.values():
+            for cells in embryo.values():
+                real_cells.update(cells.keys())
+
+        train_eval_overlap = train_cells & eval_cells
+        train_real_overlap = train_cells & real_cells
+
+        print(f"\n{'='*60}")
+        print("DATA DIAGNOSTIC")
+        print(f"{'='*60}")
+        print(f"\nCell name coverage:")
+        print(f"  Training unique cells: {len(train_cells)}")
+        print(f"  Eval unique cells: {len(eval_cells)}")
+        print(f"  Real unique cells: {len(real_cells)}")
+        print(f"\n  Train-Eval overlap: {len(train_eval_overlap)} ({100*len(train_eval_overlap)/max(1,len(eval_cells)):.1f}% of eval)")
+        print(f"  Train-Real overlap: {len(train_real_overlap)} ({100*len(train_real_overlap)/max(1,len(real_cells)):.1f}% of real)")
+
+        print(f"\n  Sample training names: {sorted(list(train_cells))[:10]}")
+        print(f"  Sample eval names: {sorted(list(eval_cells))[:10]}")
+        print(f"  Sample real names: {sorted(list(real_cells))[:10]}")
+
+        if len(train_real_overlap) < len(real_cells) * 0.5:
+            print("\n  ⚠ WARNING: Real embryo cell names don't match training data!")
+            print("    Real data accuracy will be low due to naming mismatch.")
+
+    def check_manifold_coverage(self):
+        """Check what % of test cells are in manifold"""
+        if self.reference_labels is None:
+            print("  Manifold not built yet")
+            return
+
+        eval_cells = set()
+        for embryo in self.eval_data.values():
+            for cells in embryo.values():
+                eval_cells.update(cells.keys())
+
+        manifold_cells = set(self.reference_labels)
+        coverage = len(eval_cells & manifold_cells) / max(1, len(eval_cells))
+
+        print(f"\n{'='*60}")
+        print("MANIFOLD COVERAGE")
+        print(f"{'='*60}")
+        print(f"  Eval unique cells: {len(eval_cells)}")
+        print(f"  Manifold unique cells: {len(manifold_cells)}")
+        print(f"  Coverage: {coverage:.1%}")
+
+        if coverage < 0.8:
+            missing = eval_cells - manifold_cells
+            print(f"\n  ⚠ WARNING: Only {coverage:.1%} of eval cells in manifold!")
+            print(f"  Missing cells (sample): {sorted(list(missing))[:20]}")
+
     def forward_with_masks(
         self,
         coords1: np.ndarray,
@@ -700,16 +773,17 @@ class FixedEvaluationEngine:
 
     def build_reference_manifold(self, n_pairs_per_embryo: int = 50):
         """
-        Build reference manifold using multi-reference aggregation.
+        Build reference manifold - store ALL cell embeddings, not just shared.
 
-        CRITICAL: Sample overlapping cells intentionally to maximize manifold coverage.
-        Each cell gets multiple embeddings from different context pairings,
-        which are averaged for stability.
+        CRITICAL FIX: Previous version only stored embeddings for cells that
+        appeared in BOTH samples of a pair. This version stores embeddings
+        for ALL cells in both samples, dramatically increasing manifold coverage.
         """
-        print("\nBuilding reference manifold with multi-reference aggregation...")
+        print("\nBuilding reference manifold (storing ALL cells)...")
 
         # Collect embeddings: cell_id -> list of embeddings
         cell_embeddings = defaultdict(list)
+        sampler = ImprovedSampler(min_cells=5, max_cells=20)
 
         # Build embryo timelines
         embryo_timelines = {}
@@ -736,31 +810,9 @@ class FixedEvaluationEngine:
                 t1, cells1 = timeline[idx1]
                 t2, cells2 = timeline[idx2]
 
-                # Find shared cells between timepoints
-                shared_cells = set(cells1.keys()) & set(cells2.keys())
-                if len(shared_cells) < 3:
-                    continue
-
-                # CRITICAL: Sample cells that INCLUDE shared ones for maximum overlap
-                shared_list = list(shared_cells)
-                n_shared_to_include = min(len(shared_list), 15)
-                selected_shared = random.sample(shared_list, n_shared_to_include)
-
-                # Build sample 1: shared cells + some unique to timepoint 1
-                cell_ids1 = list(selected_shared)
-                unique1 = [c for c in cells1.keys() if c not in shared_cells]
-                n_extra1 = min(len(unique1), 20 - len(cell_ids1))
-                if n_extra1 > 0:
-                    cell_ids1.extend(random.sample(unique1, n_extra1))
-                coords1 = np.array([cells1[cid] for cid in cell_ids1])
-
-                # Build sample 2: shared cells + some unique to timepoint 2
-                cell_ids2 = list(selected_shared)
-                unique2 = [c for c in cells2.keys() if c not in shared_cells]
-                n_extra2 = min(len(unique2), 20 - len(cell_ids2))
-                if n_extra2 > 0:
-                    cell_ids2.extend(random.sample(unique2, n_extra2))
-                coords2 = np.array([cells2[cid] for cid in cell_ids2])
+                # Sample cells from each timepoint (no overlap requirement)
+                cell_ids1, coords1 = sampler.sample_cells(cells1, strategy='mixed')
+                cell_ids2, coords2 = sampler.sample_cells(cells2, strategy='mixed')
 
                 if len(cell_ids1) < 5 or len(cell_ids2) < 5:
                     continue
@@ -772,13 +824,16 @@ class FixedEvaluationEngine:
                 # Forward pass with masks
                 emb1, emb2, _ = self.forward_with_masks(coords1_norm, coords2_norm)
 
-                # Store embeddings for the shared/matched cells
-                for cid in selected_shared:
-                    idx1 = cell_ids1.index(cid)
-                    idx2 = cell_ids2.index(cid)
-                    # Average embeddings from both sides
-                    avg_emb = (emb1[idx1] + emb2[idx2]) / 2
-                    cell_embeddings[cid].append(avg_emb)
+                # CRITICAL FIX: Store ALL embeddings from BOTH samples
+                # This ensures we capture embeddings for all cells, not just shared ones
+                for i, cid in enumerate(cell_ids1):
+                    cell_embeddings[cid].append(emb1[i])
+
+                # Also store from pc2 (the reference side)
+                # Note: emb2 may have one extra token (no-match) at the end if model uses it
+                for i, cid in enumerate(cell_ids2):
+                    if i < len(emb2):  # Safety check for no-match token
+                        cell_embeddings[cid].append(emb2[i])
 
                 pairs_this_embryo += 1
                 total_pairs += 1
@@ -1379,14 +1434,21 @@ class FixedEvaluationEngine:
             'by_size': by_size_pct
         }
 
-    def evaluate_baselines(self) -> Dict[str, ConfidenceInterval]:
+    def evaluate_baselines(self, cross_embryo: bool = True) -> Dict[str, ConfidenceInterval]:
         """
         Evaluate baseline methods (no learned components).
+
+        CRITICAL FIX: Use the SAME task as the model for fair comparison.
+        - cross_embryo=True: Match cells across different embryos (like model)
+        - cross_embryo=False: Match distant timepoints (10+ apart) in same embryo
+
+        Old approach matched consecutive timepoints (trivially easy, ~85%).
+        Fixed approach should give baselines ~40-60%.
 
         Returns:
             Dictionary of method name -> accuracy CI
         """
-        print("\nEvaluating baselines...")
+        print("\nEvaluating baselines (FAIR comparison - same task as model)...")
 
         baselines = {
             'ICP': ICPBaseline(),
@@ -1401,39 +1463,86 @@ class FixedEvaluationEngine:
             print(f"  {name}...")
             accuracies = []
 
-            for embryo_id, timepoints in tqdm(self.eval_data.items(), desc=name, leave=False):
-                embryo_correct = 0
-                embryo_total = 0
+            if cross_embryo:
+                # FAIR EVALUATION: Cross-embryo matching (same as model)
+                # Match eval embryo timepoints to TRAINING embryo timepoints
+                for embryo_id, timepoints in tqdm(self.eval_data.items(), desc=name, leave=False):
+                    embryo_correct = 0
+                    embryo_total = 0
 
-                timepoint_list = list(timepoints.items())
-                if len(timepoint_list) < 2:
-                    continue
+                    for t, cells in timepoints.items():
+                        if len(cells) < 5:
+                            continue
 
-                # Evaluate by pairing timepoints within embryo
-                for i in range(len(timepoint_list) - 1):
-                    t1, cells1 = timepoint_list[i]
-                    t2, cells2 = timepoint_list[i + 1]
+                        # Sample from eval embryo (query)
+                        query_ids, query_coords = sampler.sample_cells(cells, strategy='mixed')
+                        if len(query_ids) < 5:
+                            continue
 
-                    shared = set(cells1.keys()) & set(cells2.keys())
-                    if len(shared) < 3:
+                        embryo_stage = len(cells)
+
+                        # Find a DIFFERENT embryo from training data with overlapping cells
+                        # This matches what the model is tested on
+                        pairs = self.find_overlapping_pairs(
+                            query_ids, embryo_stage,
+                            min_overlap=1, n_pairs=1
+                        )
+
+                        if len(pairs) == 0:
+                            continue
+
+                        ref_ids, ref_coords = pairs[0]
+
+                        # Run baseline
+                        predictions = baseline.match(query_coords, query_ids, ref_coords, ref_ids)
+
+                        # Evaluate only on overlapping cells (fair comparison)
+                        for query_id, pred_id in predictions.items():
+                            if query_id in ref_ids:  # Only count cells that exist in reference
+                                embryo_total += 1
+                                if query_id == pred_id:
+                                    embryo_correct += 1
+
+                    if embryo_total > 0:
+                        accuracies.append(embryo_correct / embryo_total)
+            else:
+                # ALTERNATIVE: Distant timepoints in same embryo (10+ apart)
+                for embryo_id, timepoints in tqdm(self.eval_data.items(), desc=name, leave=False):
+                    embryo_correct = 0
+                    embryo_total = 0
+
+                    timepoint_list = list(timepoints.items())
+                    timepoint_list.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
+
+                    if len(timepoint_list) < 15:  # Need enough timepoints for 10+ gap
                         continue
 
-                    ids1, coords1 = sampler.sample_cells(cells1, strategy='mixed')
-                    ids2, coords2 = sampler.sample_cells(cells2, strategy='mixed')
+                    # Match distant timepoints (gap >= 10)
+                    for i in range(len(timepoint_list)):
+                        for j in range(i + 10, len(timepoint_list)):  # Gap of at least 10
+                            t1, cells1 = timepoint_list[i]
+                            t2, cells2 = timepoint_list[j]
 
-                    if len(ids1) < 5 or len(ids2) < 5:
-                        continue
+                            shared = set(cells1.keys()) & set(cells2.keys())
+                            if len(shared) < 3:
+                                continue
 
-                    predictions = baseline.match(coords1, ids1, coords2, ids2)
+                            ids1, coords1 = sampler.sample_cells(cells1, strategy='mixed')
+                            ids2, coords2 = sampler.sample_cells(cells2, strategy='mixed')
 
-                    for query_id, pred_id in predictions.items():
-                        if query_id in ids2:  # Only count overlapping cells
-                            embryo_total += 1
-                            if query_id == pred_id:
-                                embryo_correct += 1
+                            if len(ids1) < 5 or len(ids2) < 5:
+                                continue
 
-                if embryo_total > 0:
-                    accuracies.append(embryo_correct / embryo_total)
+                            predictions = baseline.match(coords1, ids1, coords2, ids2)
+
+                            for query_id, pred_id in predictions.items():
+                                if query_id in ids2:  # Only count overlapping cells
+                                    embryo_total += 1
+                                    if query_id == pred_id:
+                                        embryo_correct += 1
+
+                    if embryo_total > 0:
+                        accuracies.append(embryo_correct / embryo_total)
 
             if len(accuracies) > 0:
                 results[name] = StatisticalAnalysis.bootstrap_ci(accuracies)
@@ -1501,29 +1610,38 @@ class FixedEvaluationEngine:
         """
         Run complete evaluation pipeline.
 
-        1. Sanity checks
-        2. Build reference manifold
-        3. Evaluate on simulated data
-        4. Evaluate on real data
-        5. Evaluate baselines
-        6. Generate visualizations
-        7. Save results
+        1. Load data and model
+        2. Run diagnostics (data coverage, naming)
+        3. Sanity checks
+        4. Build reference manifold
+        5. Check manifold coverage
+        6. Evaluate on simulated data
+        7. Evaluate on real data
+        8. Evaluate baselines (fair comparison)
+        9. Generate visualizations
+        10. Save results
         """
         os.makedirs(output_dir, exist_ok=True)
 
         print("\n" + "="*60)
-        print("COMPREHENSIVE EVALUATION SUITE")
+        print("COMPREHENSIVE EVALUATION SUITE (FIXED)")
         print("="*60)
 
         # Load everything
         self.load_data()
         self.load_model()
 
-        # Sanity checks first
+        # Run diagnostics first
+        self.diagnose_real_data()
+
+        # Sanity checks
         self.run_sanity_checks()
 
         # Build manifold
         self.build_reference_manifold()
+
+        # Check manifold coverage
+        self.check_manifold_coverage()
 
         # Visualize manifold
         self.visualize_tsne(os.path.join(output_dir, "embedding_tsne.png"))
