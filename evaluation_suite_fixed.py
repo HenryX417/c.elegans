@@ -214,7 +214,11 @@ class CelegansLineage:
         cell_id = str(cell_id).strip()
         upper_id = cell_id.upper()
 
-        for founder in CelegansLineage.FOUNDERS:
+        # Check founders in order of specificity (longest first to avoid partial matches)
+        # e.g., check 'EMS' before 'E', 'AB' before 'A'
+        founders_by_length = sorted(CelegansLineage.FOUNDERS, key=len, reverse=True)
+
+        for founder in founders_by_length:
             if upper_id.startswith(founder):
                 return {
                     'founder': founder,
@@ -225,8 +229,47 @@ class CelegansLineage:
 
     @staticmethod
     def get_founder(cell_id: str) -> str:
-        """Get founder lineage of a cell"""
-        return CelegansLineage.parse_cell_id(cell_id)['founder']
+        """
+        Extract founder lineage from cell ID.
+
+        Returns one of: AB, MS, E, C, D, P4, P3, P2, P1, P0, EMS, Z2, Z3, or UNKNOWN
+        """
+        cell_upper = str(cell_id).strip().upper()
+
+        # Check in order of specificity (longest matches first)
+        # This prevents 'E' matching before 'EMS'
+        if cell_upper.startswith('EMS'):
+            return 'EMS'
+        elif cell_upper.startswith('AB'):
+            return 'AB'
+        elif cell_upper.startswith('MS'):
+            return 'MS'
+        elif cell_upper.startswith('P4'):
+            return 'P4'
+        elif cell_upper.startswith('P3'):
+            return 'P3'
+        elif cell_upper.startswith('P2'):
+            return 'P2'
+        elif cell_upper.startswith('P1'):
+            return 'P1'
+        elif cell_upper.startswith('P0'):
+            return 'P0'
+        elif cell_upper.startswith('Z2'):
+            return 'Z2'
+        elif cell_upper.startswith('Z3'):
+            return 'Z3'
+        elif cell_upper.startswith('E'):
+            return 'E'
+        elif cell_upper.startswith('C'):
+            return 'C'
+        elif cell_upper.startswith('D'):
+            return 'D'
+        elif cell_upper.startswith('P'):
+            return 'P'
+        elif cell_upper.startswith('Z'):
+            return 'Z'
+
+        return 'UNKNOWN'
 
     @staticmethod
     def get_parent(cell_id: str) -> Optional[str]:
@@ -1106,11 +1149,108 @@ class NoCheatingEvaluator:
         return significance
 
     # =========================================================================
+    # EMBEDDING COLLECTION
+    # =========================================================================
+    @torch.no_grad()
+    def collect_embeddings(
+        self,
+        data: Dict,
+        max_cells: int = 3000
+    ) -> Tuple[np.ndarray, List[str]]:
+        """
+        Collect cell embeddings for t-SNE visualization.
+
+        Uses a CONSISTENT reference set to ensure embeddings are comparable
+        across different query cells (joint encoding depends on both inputs).
+
+        Args:
+            data: Embryo data dict
+            max_cells: Maximum cells to collect
+
+        Returns:
+            embeddings: (n_cells, embed_dim) array
+            labels: List of cell IDs
+        """
+        print("\n  Collecting embeddings for t-SNE...")
+        self.model.eval()
+
+        all_embeddings = []
+        all_labels = []
+
+        # Get a FIXED reference for consistent embeddings
+        # Use a representative stage
+        median_stage = 50
+        fixed_refs = self.find_stage_matched_references(median_stage, n_refs=1)
+        if not fixed_refs:
+            print("    WARNING: Could not find fixed reference")
+            return np.array([]), []
+
+        fixed_ref_ids, fixed_ref_coords = fixed_refs[0]
+        n_ref = len(fixed_ref_ids)
+
+        # Collect embeddings from evaluation data
+        cell_count = 0
+        for embryo, timepoints in data.items():
+            if cell_count >= max_cells:
+                break
+
+            for t, cells in timepoints.items():
+                if cell_count >= max_cells:
+                    break
+
+                cell_ids = list(cells.keys())
+                n_cells = len(cell_ids)
+
+                if n_cells < self.config.MIN_CELLS:
+                    continue
+
+                # Sample cells
+                n_sample = min(n_cells, self.config.MAX_CELLS)
+                if n_cells > n_sample:
+                    sampled_indices = np.random.choice(n_cells, n_sample, replace=False)
+                    sampled_ids = [cell_ids[i] for i in sampled_indices]
+                else:
+                    sampled_ids = cell_ids
+
+                # Get coordinates and normalize
+                query_coords = np.array([cells[c] for c in sampled_ids])
+                query_norm = self.normalize_coords(query_coords)
+
+                # Forward pass with fixed reference
+                pc1 = torch.tensor(query_norm, dtype=torch.float32).unsqueeze(0).to(self.device)
+                pc2 = torch.tensor(fixed_ref_coords, dtype=torch.float32).unsqueeze(0).to(self.device)
+                mask1 = torch.ones(1, len(sampled_ids), device=self.device)
+                mask2 = torch.ones(1, n_ref, device=self.device)
+
+                z1, z2, _ = self.model(pc1, pc2, mask1, mask2, epoch=100)
+
+                # Extract query embeddings
+                if self.model.use_uncertainty:
+                    emb = z1[0].squeeze(0).cpu().numpy()  # (n_query, dim)
+                else:
+                    emb = z1.squeeze(0).cpu().numpy()
+
+                # Store embeddings and labels
+                for i, cell_id in enumerate(sampled_ids):
+                    if cell_count >= max_cells:
+                        break
+                    all_embeddings.append(emb[i])
+                    all_labels.append(cell_id)
+                    cell_count += 1
+
+        print(f"    Collected {len(all_embeddings)} cell embeddings")
+        return np.array(all_embeddings), all_labels
+
+    # =========================================================================
     # VISUALIZATION METHODS
     # =========================================================================
     def visualize_tsne_by_founder(self, embeddings: np.ndarray, labels: List[str], output_dir: str):
         """t-SNE visualization colored by founder lineage"""
         print("  Generating t-SNE visualization...")
+
+        if len(embeddings) == 0:
+            print("    No embeddings to visualize")
+            return
 
         # Subsample if needed
         max_pts = 3000
@@ -1121,13 +1261,33 @@ class NoCheatingEvaluator:
         else:
             emb, labs = embeddings, labels
 
-        # Run t-SNE (max_iter for newer sklearn, n_iter for older)
+        # Use higher perplexity for better global structure
+        # Perplexity should be 5-50, with larger values for larger datasets
+        n_samples = len(emb)
+        perplexity = min(100, max(30, n_samples // 30))  # Higher perplexity for better clustering
+
+        print(f"    Running t-SNE with {n_samples} samples, perplexity={perplexity}")
+
+        # Run t-SNE with more iterations for better convergence
         try:
-            tsne = TSNE(n_components=2, perplexity=min(50, len(emb)//4),
-                       random_state=42, max_iter=2000, init='pca')
+            tsne = TSNE(
+                n_components=2,
+                perplexity=perplexity,
+                random_state=42,
+                max_iter=3000,  # More iterations for better convergence
+                learning_rate='auto',
+                init='pca',
+                early_exaggeration=12.0
+            )
         except TypeError:
-            tsne = TSNE(n_components=2, perplexity=min(50, len(emb)//4),
-                       random_state=42, n_iter=2000, init='pca')
+            # Fallback for older sklearn
+            tsne = TSNE(
+                n_components=2,
+                perplexity=perplexity,
+                random_state=42,
+                n_iter=3000,
+                init='pca'
+            )
         emb_2d = tsne.fit_transform(emb)
 
         # Plot
@@ -1414,6 +1574,14 @@ class NoCheatingEvaluator:
                 self.visualize_accuracy_by_size(simulated_results['by_size'], figure_dir)
             if simulated_results.get('error_analysis'):
                 self.visualize_error_analysis(simulated_results['error_analysis'], figure_dir)
+
+            # t-SNE visualization of embeddings
+            print("\n" + "="*60)
+            print("GENERATING t-SNE VISUALIZATION")
+            print("="*60)
+            embeddings, labels = self.collect_embeddings(self.eval_data, max_cells=3000)
+            if len(embeddings) > 0:
+                self.visualize_tsne_by_founder(embeddings, labels, figure_dir)
 
         # Real embryo data
         if run_real_embryo and self.real_data:
