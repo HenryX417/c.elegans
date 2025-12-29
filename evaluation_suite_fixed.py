@@ -1121,9 +1121,13 @@ class NoCheatingEvaluator:
         else:
             emb, labs = embeddings, labels
 
-        # Run t-SNE
-        tsne = TSNE(n_components=2, perplexity=min(50, len(emb)//4),
-                   random_state=42, n_iter=2000, init='pca')
+        # Run t-SNE (max_iter for newer sklearn, n_iter for older)
+        try:
+            tsne = TSNE(n_components=2, perplexity=min(50, len(emb)//4),
+                       random_state=42, max_iter=2000, init='pca')
+        except TypeError:
+            tsne = TSNE(n_components=2, perplexity=min(50, len(emb)//4),
+                       random_state=42, n_iter=2000, init='pca')
         emb_2d = tsne.fit_transform(emb)
 
         # Plot
