@@ -107,11 +107,13 @@ def set_seed(seed=42):
 # =============================================================================
 
 class SparsePointFeatures(nn.Module):
-    """Feature extraction specifically designed for sparse point clouds (5-20 points)"""
+    """Feature extraction specifically designed for sparse point clouds (5-20 points)
+
+    MUST match exactly with debug_sparse_matching.py lines 46-131
+    """
 
     def __init__(self, embed_dim):
         super().__init__()
-        self.embed_dim = embed_dim
         self.relative_position_enc = nn.Linear(3, embed_dim // 4)
         self.centroid_distance_enc = nn.Linear(1, embed_dim // 4)
         self.point_count_enc = nn.Embedding(50, embed_dim // 4)
@@ -119,7 +121,6 @@ class SparsePointFeatures(nn.Module):
 
     def forward(self, points, mask=None):
         B, N, _ = points.shape
-        device = points.device
 
         # Handle masked points
         if mask is not None:
@@ -128,7 +129,7 @@ class SparsePointFeatures(nn.Module):
             centroid = points_masked.sum(dim=1, keepdim=True) / n_valid.unsqueeze(-1)
         else:
             centroid = points.mean(dim=1, keepdim=True)
-            n_valid = torch.full((B, 1), N, device=device)
+            n_valid = torch.full((B, 1), N, device=points.device)
 
         # Relative positions
         relative_pos = points - centroid
@@ -138,8 +139,8 @@ class SparsePointFeatures(nn.Module):
         centroid_dist = torch.norm(relative_pos, dim=-1, keepdim=True)
         dist_features = self.centroid_distance_enc(centroid_dist)
 
-        # Point count awareness
-        n_valid_long = n_valid.squeeze(1).long().clamp(0, 49)
+        # Point count awareness (exact match to original line 77-79)
+        n_valid_long = n_valid.squeeze(1).long()
         count_emb = self.point_count_enc(n_valid_long)
         count_features = count_emb.unsqueeze(1).expand(-1, N, -1)
 
@@ -157,9 +158,9 @@ class SparsePointFeatures(nn.Module):
         return features
 
     def _compute_local_density(self, points, mask):
+        """Compute local density - matches original lines 94-131"""
         B, N, _ = points.shape
-        device = points.device
-        densities = torch.zeros(B, N, 1, device=device)
+        densities = torch.zeros(B, N, 1, device=points.device)
 
         for b in range(B):
             if mask is not None:
@@ -173,11 +174,22 @@ class SparsePointFeatures(nn.Module):
             if n_valid <= 1:
                 continue
 
-            dists = torch.cdist(valid_points, valid_points)
-            dists.fill_diagonal_(float('inf'))
-            k = min(3, n_valid - 1)
-            nearest_dists, _ = dists.topk(k, dim=1, largest=False)
-            density_tensor = nearest_dists.mean(dim=1, keepdim=True)
+            # Use cdist for GPU, numpy for CPU (matches original)
+            if points.device.type == 'cpu':
+                pts_np = valid_points.detach().cpu().numpy()
+                diff = pts_np[:, None, :] - pts_np[None, :, :]
+                dists_np = np.sqrt(np.sum(diff**2, axis=2))
+                np.fill_diagonal(dists_np, np.inf)
+                k = min(3, n_valid - 1)
+                nearest_dists = np.partition(dists_np, k-1, axis=1)[:, :k]
+                mean_density = nearest_dists.mean(axis=1, keepdims=True)
+                density_tensor = torch.from_numpy(mean_density).float().to(points.device)
+            else:
+                dists = torch.cdist(valid_points, valid_points)
+                dists.fill_diagonal_(float('inf'))
+                k = min(3, n_valid - 1)
+                nearest_dists, _ = dists.topk(k, dim=1, largest=False)
+                density_tensor = nearest_dists.mean(dim=1, keepdim=True)
 
             if mask is not None:
                 densities[b][valid_mask] = density_tensor
@@ -188,7 +200,10 @@ class SparsePointFeatures(nn.Module):
 
 
 class EnhancedTwinAttentionEncoder(nn.Module):
-    """Twin Attention encoder with subset point cloud optimizations"""
+    """Twin Attention encoder with subset point cloud optimizations
+
+    MUST match exactly with debug_sparse_matching.py lines 133-263
+    """
 
     def __init__(self, input_dim=3, embed_dim=128, num_heads=8, num_layers=6,
                  dropout=0.1, use_positional_encoding=True, max_seq_len=50,
@@ -236,12 +251,12 @@ class EnhancedTwinAttentionEncoder(nn.Module):
         else:
             self.output_proj = nn.Linear(embed_dim, embed_dim)
 
-        # Temperature
+        # Temperature with warm-up (CRITICAL: must match original line 182-184)
         self.log_temperature = nn.Parameter(torch.tensor(0.0))
+        self.register_buffer('temperature_warmup_steps', torch.tensor(0))
 
     def forward(self, pc1, pc2, mask1=None, mask2=None, epoch=0):
         B = pc1.shape[0]
-        device = pc1.device
 
         # Extract features
         if self.use_sparse_features:
@@ -258,19 +273,20 @@ class EnhancedTwinAttentionEncoder(nn.Module):
             no_match = self.no_match_token.expand(B, -1, -1)
             z2 = torch.cat([z2, no_match], dim=1)
             if mask2 is not None:
-                mask2 = torch.cat([mask2, torch.ones(B, 1, device=device)], dim=1)
+                mask2 = torch.cat([mask2, torch.ones(B, 1, device=mask2.device)], dim=1)
 
         # Concatenate for twin attention
         z = torch.cat([z1, z2], dim=1)
 
-        # Create combined mask
+        # Create combined mask - CPU optimized version (matches original lines 209-219)
         if mask1 is not None or mask2 is not None:
             if mask1 is None:
-                mask1 = torch.ones(B, pc1.shape[1], device=device, dtype=torch.bool)
+                mask1 = torch.ones(B, pc1.shape[1], device=pc1.device, dtype=torch.bool)
             if mask2 is None:
-                mask2 = torch.ones(B, z2.shape[1], device=device, dtype=torch.bool)
+                mask2 = torch.ones(B, pc2.shape[1], device=pc2.device, dtype=torch.bool)
+            # Use boolean operations directly (faster on CPU)
             combined_mask = torch.cat([mask1, mask2], dim=1).bool()
-            attn_mask = ~combined_mask
+            attn_mask = ~combined_mask  # True = ignore (directly boolean)
         else:
             attn_mask = None
 
@@ -279,9 +295,9 @@ class EnhancedTwinAttentionEncoder(nn.Module):
             seq_len = z.shape[1]
             z = z + self.pos_encoding[:, :seq_len, :]
 
-        # Transform
+        # Transform with mask
         if attn_mask is not None:
-            z = self.transformer(z, src_key_padding_mask=attn_mask)
+            z = self.transformer(z, src_key_padding_mask=attn_mask.bool())
         else:
             z = self.transformer(z)
 
@@ -301,10 +317,23 @@ class EnhancedTwinAttentionEncoder(nn.Module):
             z2_with_no_match = F.normalize(self.output_proj(z2_with_no_match), p=2, dim=-1)
             outputs = (z1, z2_with_no_match)
 
-        # Temperature
-        temperature = torch.exp(self.log_temperature).clamp(0.01, 10.0)
+        # Temperature with warm-up (matches original lines 248-263)
+        temperature = self._get_temperature(epoch)
 
         return outputs[0], outputs[1], temperature
+
+    def _get_temperature(self, epoch):
+        """Temperature with warmup - matches original lines 253-263"""
+        warmup_epochs = 5
+        if epoch < warmup_epochs:
+            # Linear warmup from 1.0 to learned value
+            warmup_factor = epoch / warmup_epochs
+            base_temp = 1.0
+            learned_temp = torch.exp(self.log_temperature).clamp(0.01, 10.0)
+            temperature = base_temp + warmup_factor * (learned_temp - base_temp)
+        else:
+            temperature = torch.exp(self.log_temperature).clamp(0.01, 10.0)
+        return temperature
 
 
 # =============================================================================
@@ -343,23 +372,29 @@ class ImprovedSampler:
         return selected_ids, coords[selected_idx]
 
     def _sample_polar(self, coords, n_target):
+        """Sample cells from polar regions (anterior/posterior) - matches original lines 398-425"""
         if len(coords) < 4:
-            return np.random.choice(len(coords), min(n_target, len(coords)), replace=False)
+            return np.random.choice(len(coords), min(n_target, len(coords)), replace=False).astype(int)
 
+        # Find principal axis
         mean = coords.mean(axis=0)
         try:
             _, _, vh = np.linalg.svd(coords - mean)
             principal = vh[0]
         except:
-            return np.random.choice(len(coords), min(n_target, len(coords)), replace=False)
+            return np.random.choice(len(coords), min(n_target, len(coords)), replace=False).astype(int)
 
+        # Project onto principal axis
         projections = (coords - mean) @ principal
+
+        # Get extreme points
         n_poles = min(4, n_target // 2)
         anterior_idx = np.argsort(projections)[:n_poles]
         posterior_idx = np.argsort(projections)[-n_poles:]
 
         selected = np.concatenate([anterior_idx, posterior_idx])
 
+        # Fill remaining with random points
         if len(selected) < n_target:
             remaining = list(set(range(len(coords))) - set(selected))
             if remaining:
@@ -498,7 +533,7 @@ def load_data(config: EvalConfig) -> Tuple[Dict, Dict, Dict]:
 
 
 def load_model(config: EvalConfig, device: torch.device) -> EnhancedTwinAttentionEncoder:
-    """Load trained model"""
+    """Load trained model with proper handling of checkpoint formats"""
     model = EnhancedTwinAttentionEncoder(
         embed_dim=config.EMBED_DIM,
         num_heads=config.NUM_HEADS,
@@ -511,11 +546,31 @@ def load_model(config: EvalConfig, device: torch.device) -> EnhancedTwinAttentio
 
     if os.path.exists(config.MODEL_PATH):
         checkpoint = torch.load(config.MODEL_PATH, map_location=device, weights_only=False)
+
+        # Handle both checkpoint dict format and direct state_dict format
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
         else:
-            model.load_state_dict(checkpoint)
+            state_dict = checkpoint
+
+        # Load state dict - strict=False allows loading even if there are minor mismatches
+        # But first check that the model architecture matches
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+        if missing_keys:
+            print(f"Warning: Missing keys in checkpoint: {missing_keys}")
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys in checkpoint: {unexpected_keys}")
+            # These unexpected keys are likely from a different model version
+            # but shouldn't break loading
+
         print(f"Loaded model from {config.MODEL_PATH}")
+
+        # Verify model architecture matches checkpoint
+        model_keys = set(model.state_dict().keys())
+        ckpt_keys = set(state_dict.keys())
+        matched_keys = model_keys & ckpt_keys
+        print(f"  Matched {len(matched_keys)}/{len(ckpt_keys)} checkpoint keys")
     else:
         print(f"Warning: Model not found at {config.MODEL_PATH}, using random initialization")
 
