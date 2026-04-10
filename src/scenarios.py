@@ -45,6 +45,12 @@ def _default_budget(park: Park, resource_types: list, scenario_cfg: dict) -> flo
     return rangers * ranger_cost + tech_budget
 
 
+def _rangers_only_caps(resource_types: list, n_rangers: int) -> dict[str, int]:
+    """Supply caps that only allow ranger_foot_team placement."""
+    return {rt.name: (n_rangers if rt.name == "ranger_foot_team" else 0)
+            for rt in resource_types}
+
+
 def run_baseline(
     park: Park,
     resource_types: list,
@@ -53,14 +59,15 @@ def run_baseline(
     seed: int = 42,
     verbose: bool = False,
 ) -> tuple[Allocation, RiskSurface, dict]:
-    """Run baseline scenario: current resources, no extras.
+    """Run baseline scenario: current resources (rangers only), no extra tech.
 
     Returns:
         (allocation, risk_surface, scores_dict)
     """
     rs = build_risk_surface(park, season=season)
-    budget = park.config.get("current_rangers", 100) * 1.0  # ranger cost = 1.0
-    caps = {"ranger_foot_team": park.config.get("current_rangers", 100)}
+    n_rangers = park.config.get("current_rangers", 100)
+    budget = n_rangers * 1.0  # ranger cost = 1.0
+    caps = _rangers_only_caps(resource_types, n_rangers)
 
     alloc = make_empty_allocation(park, rs, resource_types, budget, caps, kernel)
     alloc = greedy_allocate_fast(alloc, verbose=verbose)
@@ -78,19 +85,19 @@ def run_dry_season(
     Returns:
         (wet_alloc, dry_alloc, wet_scores, dry_scores)
     """
-    budget = baseline_alloc.budget_limit
-    caps_dict = {rt.name: int(baseline_alloc.supply_caps[k])
-                 for k, rt in enumerate(baseline_alloc.resource_types)}
+    n_rangers = park.config.get("current_rangers", 100)
+    budget = n_rangers * 1.0
+    caps = _rangers_only_caps(resource_types, n_rangers)
 
     # Wet season (lower risk, baseline conditions)
     rs_wet = build_risk_surface(park, season="wet")
-    alloc_wet = make_empty_allocation(park, rs_wet, resource_types, budget, caps_dict, kernel)
+    alloc_wet = make_empty_allocation(park, rs_wet, resource_types, budget, caps, kernel)
     alloc_wet = greedy_allocate_fast(alloc_wet, verbose=verbose)
     scores_wet = _compute_all_scores(alloc_wet)
 
     # Dry season (higher risk, concentrated near waterholes)
     rs_dry = build_risk_surface(park, season="dry")
-    alloc_dry = make_empty_allocation(park, rs_dry, resource_types, budget, caps_dict, kernel)
+    alloc_dry = make_empty_allocation(park, rs_dry, resource_types, budget, caps, kernel)
     alloc_dry = greedy_allocate_fast(alloc_dry, verbose=verbose)
     scores_dry = _compute_all_scores(alloc_dry)
 
@@ -129,11 +136,11 @@ def run_wildfire(
     rs_modified.risk[adjacent] *= 2.0  # displaced animals + opportunistic poachers
     rs_modified.risk_by_threat[adjacent] *= 2.0
 
-    budget = baseline_alloc.budget_limit
-    caps_dict = {rt.name: int(baseline_alloc.supply_caps[k])
-                 for k, rt in enumerate(baseline_alloc.resource_types)}
+    n_rangers = park.config.get("current_rangers", 100)
+    budget = n_rangers * 1.0
+    caps = _rangers_only_caps(resource_types, n_rangers)
 
-    alloc = make_empty_allocation(park, rs_modified, resource_types, budget, caps_dict, kernel)
+    alloc = make_empty_allocation(park, rs_modified, resource_types, budget, caps, kernel)
     alloc = greedy_allocate_fast(alloc, verbose=verbose)
 
     scores = _compute_all_scores(alloc)

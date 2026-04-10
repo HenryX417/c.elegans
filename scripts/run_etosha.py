@@ -53,13 +53,15 @@ def main() -> None:
     plot_risk_surface(park, rs, name="fig_etosha_risk_surface")
     print("  -> fig_etosha_risk_surface.png")
 
-    # 3. Resources + allocation
+    # 3. Resources + allocation (baseline: rangers only)
     resource_types, kernel = load_resource_types(RESOURCES, park.config)
-    budget = park.config["current_rangers"] * 1.0
-    caps = {"ranger_foot_team": park.config["current_rangers"]}
+    n_rangers = park.config["current_rangers"]
+    budget = n_rangers * 1.0
+    caps = {rt.name: (n_rangers if rt.name == "ranger_foot_team" else 0)
+            for rt in resource_types}
 
     alloc = make_empty_allocation(park, rs, resource_types, budget, caps, kernel)
-    print(f"\nRunning greedy allocation (budget={budget:.0f}, rangers={caps['ranger_foot_team']})...")
+    print(f"\nRunning greedy allocation (budget={budget:.0f}, rangers={n_rangers})...")
     alloc = greedy_allocate_fast(alloc, verbose=True)
 
     # 4. Scores

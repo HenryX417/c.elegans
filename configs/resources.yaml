@@ -3,12 +3,12 @@
 resource_types:
   ranger_foot_team:
     cost_per_unit: 1.0          # normalized cost (ranger-team as base unit)
-    coverage_radius_km: 5.0     # effective patrol radius per shift
+    coverage_radius_km: 4.5     # effective patrol radius per shift
     detection_alpha:             # effectiveness coefficient per threat type
-      poaching: 0.6
-      wildfire: 0.2
-      human_wildlife_conflict: 0.4
-      unauthorized_entry: 0.5
+      poaching: 1.0
+      wildfire: 0.3
+      human_wildlife_conflict: 0.7
+      unauthorized_entry: 0.8
     disruption_delta: 0.15       # mild disruption to wildlife
     terrain_modifier:
       grassland: 1.0

@@ -52,10 +52,11 @@ def run_park(config_name: str, prefix: str, park_label: str) -> dict:
     plot_risk_surface(park, rs, name=f"fig_{prefix}_risk_surface")
     print(f"  -> fig_{prefix}_risk_surface.png")
 
-    # Allocate with park's current rangers
+    # Allocate with park's current rangers (baseline: rangers only)
     n_rangers = park.config.get("current_rangers", 100)
     budget = n_rangers * 1.0
-    caps = {"ranger_foot_team": n_rangers}
+    caps = {rt.name: (n_rangers if rt.name == "ranger_foot_team" else 0)
+            for rt in resource_types}
 
     alloc = make_empty_allocation(park, rs, resource_types, budget, caps, kernel)
     alloc = greedy_allocate_fast(alloc, verbose=True)
