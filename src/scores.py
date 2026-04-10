@@ -75,13 +75,17 @@ def ppi_disaggregated(alloc: Allocation) -> dict[str, dict[str, float]]:
             result["by_threat"][tname] = 0.0
 
     # By species: PPI_s = sum_i sum_t risk_st[i,s,t] * p[i,t] / sum_i sum_t risk_st[i,s,t]
+    # Explicitly loop over threats to ensure correct threat-specific p indexing
+    int_idx = np.where(interior)[0]
     for si, sname in enumerate(rs.species_names):
-        den = rs.risk_st[interior, si, :].sum()
-        if den > 1e-12:
-            num = (rs.risk_st[interior, si, :] * p[interior]).sum()
-            result["by_species"][sname] = float(num / den)
-        else:
-            result["by_species"][sname] = 0.0
+        num = 0.0
+        den = 0.0
+        for ti in range(len(rs.threat_names)):
+            risk_slice = rs.risk_st[int_idx, si, ti]      # (N_int,)
+            det_slice = p[int_idx, ti]                     # (N_int,) — threat-specific
+            num += float((risk_slice * det_slice).sum())
+            den += float(risk_slice.sum())
+        result["by_species"][sname] = float(num / den) if den > 1e-12 else 0.0
 
     return result
 
