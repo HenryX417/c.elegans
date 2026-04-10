@@ -1,0 +1,5 @@
+# Wildfire scenario — contiguous burn zone, displaced wildlife
+scenario: wildfire
+season: dry
+burn_center: [120, 70]
+burn_radius_km: 20

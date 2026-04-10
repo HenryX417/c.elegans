@@ -1,0 +1,4 @@
+# Baseline scenario — current resources, no extra technology
+scenario: baseline
+season: dry
+use_all_resources: false

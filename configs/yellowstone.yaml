@@ -1,0 +1,191 @@
+# Yellowstone National Park — IM²C 2026 Adaptation
+# ~8,983 km², mountainous, wildfire-dominant, low poaching
+
+park_name: Yellowstone National Park
+country: USA
+continent: North America
+
+area_km2: 8983
+grid_resolution_km: 5.0
+
+bounds:
+  x_min_km: 0
+  x_max_km: 100
+  y_min_km: 0
+  y_max_km: 95
+
+# Simplified outline (km coordinates)
+park_outline:
+  - [10, 5]
+  - [90, 5]
+  - [95, 20]
+  - [95, 75]
+  - [85, 90]
+  - [60, 93]
+  - [30, 90]
+  - [10, 80]
+  - [5, 50]
+  - [5, 20]
+
+# No pan equivalent — Yellowstone Lake as special zone
+pan_polygon:
+  - [50, 25]
+  - [70, 22]
+  - [75, 35]
+  - [70, 45]
+  - [55, 48]
+  - [45, 40]
+
+camps:
+  - {name: Mammoth Hot Springs, x: 30, y: 85, type: main}
+  - {name: Old Faithful, x: 25, y: 35, type: main}
+  - {name: Canyon Village, x: 55, y: 60, type: main}
+  - {name: Lake Village, x: 60, y: 40, type: main}
+  - {name: Tower Junction, x: 55, y: 80, type: secondary}
+  - {name: North Entrance, x: 30, y: 92, type: gate}
+  - {name: West Entrance, x: 5, y: 40, type: gate}
+  - {name: East Entrance, x: 95, y: 45, type: gate}
+  - {name: South Entrance, x: 50, y: 5, type: gate}
+
+waterhole_anchors:
+  - {name: Yellowstone Lake N, x: 60, y: 45}
+  - {name: Yellowstone Lake S, x: 55, y: 30}
+  - {name: Lewis Lake, x: 40, y: 15}
+  - {name: Shoshone Lake, x: 30, y: 20}
+  - {name: Yellowstone River, x: 50, y: 65}
+  - {name: Madison River, x: 20, y: 45}
+  - {name: Lamar River, x: 65, y: 80}
+  - {name: Firehole River, x: 25, y: 38}
+waterhole_total: 50
+waterhole_seed: 42
+
+road_segments:
+  - [[30, 92], [30, 85]]
+  - [[30, 85], [55, 80]]
+  - [[55, 80], [55, 60]]
+  - [[55, 60], [60, 40]]
+  - [[60, 40], [50, 5]]
+  - [[55, 60], [25, 35]]
+  - [[25, 35], [5, 40]]
+  - [[30, 85], [25, 35]]
+  - [[60, 40], [95, 45]]
+
+terrain_types:
+  alpine: 0.20
+  forest: 0.45         # dense lodgepole pine
+  grassland: 0.15      # valleys, meadows
+  wetland: 0.10        # geothermal areas, river margins
+  dolomite_hills: 0.10 # rocky outcrops
+
+current_rangers: 200
+
+species:
+  grizzly_bear:
+    weight: 1.0
+    population: 700
+    habitat_preference:
+      alpine: 0.6
+      forest: 0.8
+      grassland: 0.4
+      wetland: 0.3
+      dolomite_hills: 0.5
+    waterhole_affinity: 0.6
+    seasonal_shift: 0.2
+  wolf:
+    weight: 0.8
+    population: 100
+    habitat_preference:
+      alpine: 0.3
+      forest: 0.6
+      grassland: 0.8
+      wetland: 0.2
+      dolomite_hills: 0.3
+    waterhole_affinity: 0.4
+    seasonal_shift: 0.1
+  elk:
+    weight: 0.5
+    population: 20000
+    habitat_preference:
+      alpine: 0.4
+      forest: 0.5
+      grassland: 0.9
+      wetland: 0.3
+      dolomite_hills: 0.2
+    waterhole_affinity: 0.7
+    seasonal_shift: 0.4
+  bison:
+    weight: 0.6
+    population: 5000
+    habitat_preference:
+      alpine: 0.1
+      forest: 0.3
+      grassland: 0.9
+      wetland: 0.4
+      dolomite_hills: 0.1
+    waterhole_affinity: 0.5
+    seasonal_shift: 0.3
+
+threats:
+  wildfire:
+    weight: 1.0          # dominant threat
+    features:
+      fence_distance: 0.0
+      road_distance: 0.1
+      camp_distance: 0.1
+      waterhole_distance: 0.3
+      terrain_openness: -0.2
+      seasonal_dry: 0.6
+  poaching:
+    weight: 0.3          # low but real
+    features:
+      fence_distance: -0.3
+      road_distance: -0.2
+      camp_distance: 0.3
+      waterhole_distance: -0.3
+      terrain_openness: -0.1
+      seasonal_dry: 0.1
+  human_wildlife_conflict:
+    weight: 0.6
+    features:
+      fence_distance: -0.5
+      road_distance: -0.4
+      camp_distance: -0.5
+      waterhole_distance: 0.0
+      terrain_openness: 0.0
+      seasonal_dry: 0.1
+  unauthorized_entry:
+    weight: 0.2
+    features:
+      fence_distance: -0.6
+      road_distance: -0.2
+      camp_distance: 0.2
+      waterhole_distance: 0.0
+      terrain_openness: 0.0
+      seasonal_dry: 0.0
+
+seasons:
+  dry:
+    months: [7, 8, 9]
+    multiplier: 1.4
+  wet:
+    months: [1, 2, 3, 4, 5, 6, 10, 11, 12]
+    multiplier: 0.7
+
+density_waterhole_radius_km: 12
+density_waterhole_peak: 2.5
+density_pan_factor: 0.3       # lake area — some wildlife
+density_base: 1.0
+
+fence_perimeter_km: 500
+roads_km: 500
+annual_visitors: 4500000
+
+# Yellowstone-specific resource overrides
+resource_overrides:
+  drone:
+    terrain_modifier:
+      alpine: 0.7
+      forest: 0.3       # dense canopy limits drones
+      grassland: 1.0
+      wetland: 0.8
+      dolomite_hills: 0.8

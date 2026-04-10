@@ -1,0 +1,191 @@
+# Sierra del Divisor National Park — IM²C 2026 Adaptation
+# ~13,400 km², dense rainforest, illegal logging dominant, riverine access
+
+park_name: Sierra del Divisor National Park
+country: Peru
+continent: South America
+
+area_km2: 13400
+grid_resolution_km: 6.0   # slightly coarser due to larger area
+
+bounds:
+  x_min_km: 0
+  x_max_km: 140
+  y_min_km: 0
+  y_max_km: 110
+
+# Simplified outline
+park_outline:
+  - [10, 10]
+  - [130, 10]
+  - [135, 30]
+  - [130, 60]
+  - [125, 90]
+  - [110, 105]
+  - [70, 108]
+  - [30, 100]
+  - [10, 80]
+  - [5, 50]
+
+# No pan; river corridor as special zone (higher access = higher threat)
+pan_polygon:
+  - [10, 40]
+  - [50, 35]
+  - [80, 45]
+  - [120, 50]
+  - [120, 60]
+  - [80, 55]
+  - [50, 50]
+  - [10, 55]
+
+camps:
+  - {name: Contamana, x: 15, y: 50, type: main}
+  - {name: Divisor Station, x: 70, y: 60, type: main}
+  - {name: Ucayali Post, x: 120, y: 55, type: secondary}
+  - {name: Southern Entry, x: 50, y: 15, type: gate}
+  - {name: Northern Entry, x: 80, y: 100, type: gate}
+
+waterhole_anchors:
+  - {name: Ucayali River, x: 120, y: 55}
+  - {name: Calleria River, x: 80, y: 48}
+  - {name: Abujao River, x: 50, y: 42}
+  - {name: Interior Stream 1, x: 40, y: 70}
+  - {name: Interior Stream 2, x: 90, y: 75}
+  - {name: Headwater 1, x: 60, y: 90}
+waterhole_total: 40
+waterhole_seed: 42
+
+road_segments:
+  - [[15, 50], [50, 42]]       # Contamana to Abujao
+  - [[50, 42], [80, 48]]       # Abujao to Calleria
+  - [[80, 48], [120, 55]]      # Calleria to Ucayali
+  - [[70, 60], [80, 100]]      # Divisor to Northern Entry
+  - [[15, 50], [50, 15]]       # To Southern Entry
+
+terrain_types:
+  rainforest: 0.70
+  forest: 0.10          # transitional forest
+  wetland: 0.10         # river margins
+  dolomite_hills: 0.10  # sierra/ridge
+
+current_rangers: 80     # understaffed
+
+species:
+  jaguar:
+    weight: 1.0
+    population: 200
+    habitat_preference:
+      rainforest: 0.9
+      forest: 0.7
+      wetland: 0.3
+      dolomite_hills: 0.4
+    waterhole_affinity: 0.5
+    seasonal_shift: 0.1
+  giant_otter:
+    weight: 0.8
+    population: 150
+    habitat_preference:
+      rainforest: 0.6
+      forest: 0.3
+      wetland: 0.9
+      dolomite_hills: 0.1
+    waterhole_affinity: 0.9
+    seasonal_shift: 0.3
+  tapir:
+    weight: 0.6
+    population: 500
+    habitat_preference:
+      rainforest: 0.8
+      forest: 0.6
+      wetland: 0.5
+      dolomite_hills: 0.2
+    waterhole_affinity: 0.7
+    seasonal_shift: 0.2
+  primates:
+    weight: 0.4
+    population: 5000
+    habitat_preference:
+      rainforest: 1.0
+      forest: 0.7
+      wetland: 0.2
+      dolomite_hills: 0.3
+    waterhole_affinity: 0.3
+    seasonal_shift: 0.1
+
+threats:
+  illegal_logging:
+    weight: 1.0         # dominant threat
+    features:
+      fence_distance: -0.3
+      road_distance: -0.5   # loggers need road/river access
+      camp_distance: 0.4    # far from camps = less patrol
+      waterhole_distance: -0.4   # rivers = extraction routes
+      terrain_openness: 0.0
+      seasonal_dry: 0.3     # dry season = easier logging
+  poaching:
+    weight: 0.5
+    features:
+      fence_distance: -0.3
+      road_distance: -0.3
+      camp_distance: 0.3
+      waterhole_distance: -0.4
+      terrain_openness: 0.0
+      seasonal_dry: 0.1
+  human_wildlife_conflict:
+    weight: 0.3
+    features:
+      fence_distance: -0.6
+      road_distance: -0.3
+      camp_distance: -0.3
+      waterhole_distance: 0.0
+      terrain_openness: 0.0
+      seasonal_dry: 0.0
+  unauthorized_entry:
+    weight: 0.4
+    features:
+      fence_distance: -0.7
+      road_distance: -0.3
+      camp_distance: 0.2
+      waterhole_distance: -0.3   # river access
+      terrain_openness: 0.0
+      seasonal_dry: 0.0
+
+seasons:
+  dry:
+    months: [5, 6, 7, 8, 9, 10]
+    multiplier: 1.2
+  wet:
+    months: [11, 12, 1, 2, 3, 4]
+    multiplier: 0.9
+
+density_waterhole_radius_km: 10
+density_waterhole_peak: 2.0
+density_pan_factor: 1.5       # river corridor = high density
+density_base: 1.2             # rainforest generally high density
+
+fence_perimeter_km: 600
+roads_km: 200
+annual_visitors: 5000
+
+# Dense canopy severely limits drones and aerial
+resource_overrides:
+  drone:
+    coverage_radius_km: 6.0      # halved
+    terrain_modifier:
+      rainforest: 0.15
+      forest: 0.3
+      wetland: 0.6
+      dolomite_hills: 0.7
+  aerial_overflight:
+    coverage_radius_km: 12.0     # halved
+    terrain_modifier:
+      rainforest: 0.2
+      forest: 0.3
+      wetland: 0.5
+      dolomite_hills: 0.7
+  vehicle_patrol:
+    terrain_modifier:
+      rainforest: 0.1
+      forest: 0.2
+      wetland: 0.1
+      dolomite_hills: 0.3
