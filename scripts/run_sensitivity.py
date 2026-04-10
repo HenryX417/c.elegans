@@ -184,7 +184,7 @@ def main() -> None:
     scenario_rows = [
         {"scenario": "baseline", **{k: v for k, v in baseline_scores.items()
                                      if not isinstance(v, dict)}},
-        {"scenario": "dry_season", **{k: v for k, v in dry_scores.items()
+        {"scenario": "wet_season", **{k: v for k, v in wet_scores.items()
                                        if not isinstance(v, dict)}},
         {"scenario": "wildfire", **{k: v for k, v in fire_scores.items()
                                      if not isinstance(v, dict)}},
@@ -214,6 +214,7 @@ def main() -> None:
     # Save results
     all_results = {
         "baseline": baseline_scores,
+        "wet_season": wet_scores,
         "dry_season": dry_scores,
         "wildfire": fire_scores,
         "tech_human_pareto": {
