@@ -9,6 +9,7 @@ resource_types:
       wildfire: 0.3
       human_wildlife_conflict: 0.7
       unauthorized_entry: 0.8
+      illegal_logging: 0.5       # can spot logging activity on patrol
     disruption_delta: 0.15       # mild disruption to wildlife
     terrain_modifier:
       grassland: 1.0
@@ -31,11 +32,12 @@ resource_types:
       wildfire: 0.3
       human_wildlife_conflict: 0.5
       unauthorized_entry: 0.6
+      illegal_logging: 0.4       # road patrols intercept timber trucks
     disruption_delta: 0.35
     terrain_modifier:
       grassland: 1.0
       savanna_woodland: 0.9
-      salt_pan: 0.5              # limited road access on pan
+      salt_pan: 0.5
       mopane_woodland: 0.7
       dolomite_hills: 0.3
       forest: 0.2
@@ -44,21 +46,22 @@ resource_types:
       wetland: 0.1
     speed_kmh: 30.0
     shift_hours: 8.0
-    requires_road: true          # can only be placed near roads
+    requires_road: true
 
   fixed_sensor_tower:
     cost_per_unit: 5.0
     coverage_radius_km: 10.0
     detection_alpha:
       poaching: 0.5
-      wildfire: 0.7              # early fire detection
+      wildfire: 0.7
       human_wildlife_conflict: 0.3
       unauthorized_entry: 0.6
-    disruption_delta: 0.02       # almost no disruption (static)
+      illegal_logging: 0.3       # visual detection of logging sites
+    disruption_delta: 0.02
     terrain_modifier:
       grassland: 1.0
       savanna_woodland: 0.7
-      salt_pan: 1.0              # excellent visibility
+      salt_pan: 1.0
       mopane_woodland: 0.5
       dolomite_hills: 0.8
       forest: 0.3
@@ -74,6 +77,7 @@ resource_types:
       wildfire: 0.6
       human_wildlife_conflict: 0.3
       unauthorized_entry: 0.7
+      illegal_logging: 0.2       # limited by canopy in logging areas
     disruption_delta: 0.10
     terrain_modifier:
       grassland: 1.0
@@ -81,21 +85,22 @@ resource_types:
       salt_pan: 1.0
       mopane_woodland: 0.6
       dolomite_hills: 0.9
-      forest: 0.3                # canopy blocks view
-      rainforest: 0.15           # dense canopy, very limited
+      forest: 0.3
+      rainforest: 0.15
       alpine: 0.8
       wetland: 0.7
-    flight_hours: 4.0            # limited endurance
+    flight_hours: 4.0
 
   camera_trap:
     cost_per_unit: 0.5
-    coverage_radius_km: 0.5      # very local
+    coverage_radius_km: 0.5
     detection_alpha:
-      poaching: 0.8              # excellent at detecting intrusion
+      poaching: 0.8
       wildfire: 0.1
       human_wildlife_conflict: 0.2
       unauthorized_entry: 0.8
-    disruption_delta: 0.01       # passive, no disruption
+      illegal_logging: 0.4       # captures loggers on camera
+    disruption_delta: 0.01
     terrain_modifier:
       grassland: 0.8
       savanna_woodland: 1.0
@@ -115,7 +120,8 @@ resource_types:
       wildfire: 0.8
       human_wildlife_conflict: 0.2
       unauthorized_entry: 0.4
-    disruption_delta: 0.25       # noisy
+      illegal_logging: 0.5       # good overview of canopy clearings
+    disruption_delta: 0.25
     terrain_modifier:
       grassland: 1.0
       savanna_woodland: 0.7
@@ -130,12 +136,13 @@ resource_types:
 
   fence_sensor:
     cost_per_unit: 1.5
-    coverage_radius_km: 2.0      # only effective near fence
+    coverage_radius_km: 2.0
     detection_alpha:
       poaching: 0.4
       wildfire: 0.0
       human_wildlife_conflict: 0.5
       unauthorized_entry: 0.9
+      illegal_logging: 0.3       # detects movement along boundary
     disruption_delta: 0.01
     terrain_modifier:
       grassland: 1.0
@@ -147,7 +154,72 @@ resource_types:
       rainforest: 0.7
       alpine: 0.9
       wetland: 0.6
-    requires_fence: true         # can only be placed near fence
+    requires_fence: true
+
+  # --- NEW RESOURCE TYPES ---
+
+  acoustic_sensor:
+    cost_per_unit: 1.2
+    coverage_radius_km: 3.0      # detects chainsaw / gunshot sounds
+    detection_alpha:
+      poaching: 0.6              # gunshot detection
+      wildfire: 0.1
+      human_wildlife_conflict: 0.2
+      unauthorized_entry: 0.4
+      illegal_logging: 0.8       # chainsaw acoustic signature — primary use case
+    disruption_delta: 0.01       # passive, no disruption
+    terrain_modifier:
+      grassland: 0.7
+      savanna_woodland: 0.8
+      salt_pan: 0.5              # little sound propagation over open pan
+      mopane_woodland: 0.9
+      dolomite_hills: 0.6
+      forest: 1.0                # forest amplifies acoustic detection
+      rainforest: 0.9            # dense vegetation still carries sound
+      alpine: 0.5
+      wetland: 0.6
+
+  thermal_camera:
+    cost_per_unit: 2.0
+    coverage_radius_km: 5.0      # thermal imaging range
+    detection_alpha:
+      poaching: 0.4              # detects human body heat at night
+      wildfire: 0.9              # primary use case — early fire detection
+      human_wildlife_conflict: 0.3
+      unauthorized_entry: 0.5
+      illegal_logging: 0.2       # limited use for logging detection
+    disruption_delta: 0.02       # passive, minimal disruption
+    terrain_modifier:
+      grassland: 1.0
+      savanna_woodland: 0.8
+      salt_pan: 1.0              # excellent thermal contrast
+      mopane_woodland: 0.6
+      dolomite_hills: 0.7
+      forest: 0.4
+      rainforest: 0.3
+      alpine: 0.9
+      wetland: 0.5
+
+  ai_camera_trap:
+    cost_per_unit: 1.0
+    coverage_radius_km: 0.8      # slightly wider than basic camera trap
+    detection_alpha:
+      poaching: 1.2              # AI-enhanced: auto-classifies human vs animal, alerts in real-time
+      wildfire: 0.15
+      human_wildlife_conflict: 0.4
+      unauthorized_entry: 1.0
+      illegal_logging: 0.6       # recognizes logging equipment/vehicles
+    disruption_delta: 0.01       # passive, no disruption
+    terrain_modifier:
+      grassland: 0.8
+      savanna_woodland: 1.0
+      salt_pan: 0.5
+      mopane_woodland: 0.9
+      dolomite_hills: 0.7
+      forest: 0.9
+      rainforest: 0.8
+      alpine: 0.6
+      wetland: 0.5
 
 # Coverage kernel: how resource influence spreads to nearby cells
 coverage_kernel: gaussian       # options: gaussian, tophat
