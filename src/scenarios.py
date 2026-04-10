@@ -72,18 +72,29 @@ def run_baseline(
 def run_dry_season(
     park: Park, resource_types: list, kernel: str, baseline_alloc: Allocation,
     seed: int = 42, verbose: bool = False,
-) -> tuple[Allocation, RiskSurface, dict]:
-    """Dry season mode: boosted waterhole-proximity weights."""
-    rs = build_risk_surface(park, season="dry")
+) -> tuple[Allocation, Allocation, dict, dict]:
+    """Dry season mode: compare wet-season vs dry-season allocation.
+
+    Returns:
+        (wet_alloc, dry_alloc, wet_scores, dry_scores)
+    """
     budget = baseline_alloc.budget_limit
     caps_dict = {rt.name: int(baseline_alloc.supply_caps[k])
                  for k, rt in enumerate(baseline_alloc.resource_types)}
 
-    alloc = make_empty_allocation(park, rs, resource_types, budget, caps_dict, kernel)
-    alloc = greedy_allocate_fast(alloc, verbose=verbose)
+    # Wet season (lower risk, baseline conditions)
+    rs_wet = build_risk_surface(park, season="wet")
+    alloc_wet = make_empty_allocation(park, rs_wet, resource_types, budget, caps_dict, kernel)
+    alloc_wet = greedy_allocate_fast(alloc_wet, verbose=verbose)
+    scores_wet = _compute_all_scores(alloc_wet)
 
-    scores = _compute_all_scores(alloc)
-    return alloc, rs, scores
+    # Dry season (higher risk, concentrated near waterholes)
+    rs_dry = build_risk_surface(park, season="dry")
+    alloc_dry = make_empty_allocation(park, rs_dry, resource_types, budget, caps_dict, kernel)
+    alloc_dry = greedy_allocate_fast(alloc_dry, verbose=verbose)
+    scores_dry = _compute_all_scores(alloc_dry)
+
+    return alloc_wet, alloc_dry, scores_wet, scores_dry
 
 
 def run_wildfire(

@@ -82,18 +82,10 @@ def main() -> None:
 
     # ---- 3. Dry Season ----
     print("\n[3/9] Dry season shift...")
-    # Wet season baseline for comparison
-    wet_rs = build_risk_surface(park, season="wet")
-    wet_budget = baseline_alloc.budget_limit
-    wet_caps = {rt.name: int(baseline_alloc.supply_caps[k])
-                for k, rt in enumerate(baseline_alloc.resource_types)}
-    wet_alloc = make_empty_allocation(park, wet_rs, resource_types, wet_budget, wet_caps, kernel)
-    wet_alloc = greedy_allocate_fast(wet_alloc, verbose=False)
-
-    dry_alloc, dry_rs, dry_scores = run_dry_season(
+    wet_alloc, dry_alloc, wet_scores, dry_scores = run_dry_season(
         park, resource_types, kernel, baseline_alloc, seed=SEED
     )
-    print(f"  Dry PPI: {dry_scores['ppi']:.4f}, Wet PPI: {ppi(wet_alloc):.4f}")
+    print(f"  Dry PPI: {dry_scores['ppi']:.4f}, Wet PPI: {wet_scores['ppi']:.4f}")
     plot_comparison_maps(wet_alloc, dry_alloc,
                          name="fig_dry_season_shift",
                          title_before="Wet Season Allocation",
