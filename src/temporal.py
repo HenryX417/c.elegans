@@ -131,14 +131,21 @@ def simulate(
     rs = allocation.risk_surface
     interior = park.interior_indices
 
-    # Static detection from sensors/cameras/drones (non-mobile resources)
+    # Static detection from sensors/cameras/drones only (exclude mobile patrols)
+    # Mobile resources (rangers, vehicles) contribute via patrol routes, not static detection
+    mobile_types = {"ranger_foot_team", "vehicle_patrol"}
+    static_units = allocation.units.copy()
+    for k, rt in enumerate(allocation.resource_types):
+        if rt.name in mobile_types:
+            static_units[:, k] = 0
     effective = compute_effective_units(
-        park, allocation.resource_types, allocation.units, allocation.kernel,
+        park, allocation.resource_types, static_units, allocation.kernel,
     )
     static_p = compute_detection_prob(effective, allocation.resource_types, rs.threat_names)
 
     # Identify ranger teams and generate patrol routes
-    mobile_types = {"ranger_foot_team", "vehicle_patrol"}
+    # Group units at the same cell into a single team (more realistic than
+    # treating each unit individually, and avoids generating hundreds of routes)
     ranger_cells = []
     ranger_speeds = []
 
@@ -148,9 +155,17 @@ def simulate(
             speed = rt.extra.get("speed_kmh", 4.0)
             shift = rt.extra.get("shift_hours", 8.0)
             for cell in placed:
-                for _ in range(allocation.units[cell, k]):
-                    ranger_cells.append(cell)
-                    ranger_speeds.append((speed, shift))
+                ranger_cells.append(cell)
+                ranger_speeds.append((speed, shift))
+
+    # Cap patrol teams to keep routing tractable (max ~30 teams)
+    max_teams = 30
+    if len(ranger_cells) > max_teams:
+        # Subsample: pick the max_teams cells with highest risk as team bases
+        risks = rs.risk[ranger_cells]
+        top_indices = np.argsort(risks)[-max_teams:]
+        ranger_cells = [ranger_cells[i] for i in top_indices]
+        ranger_speeds = [ranger_speeds[i] for i in top_indices]
 
     # Generate route pools for each ranger team
     route_pools: list[list[PatrolRoute]] = []

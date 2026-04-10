@@ -208,12 +208,17 @@ def greedy_allocate(
 def greedy_allocate_fast(
     allocation: Allocation,
     verbose: bool = False,
+    batch_size: int = 10,
 ) -> Allocation:
-    """Vectorized greedy allocation — much faster for large grids.
+    """Batch-greedy submodular maximization of PPI.
 
-    Instead of evaluating every (cell, resource) pair individually, we
-    vectorize the marginal gain computation across all cells for each
-    resource type and pick the global best per iteration.
+    Uses vectorized marginal gain computation with batch placement:
+    each iteration, compute gains for all (cell, type) pairs, then place
+    the top batch_size units simultaneously before recomputing gains.
+
+    For batch_size=1, this is exact greedy (slow). Larger batches trade
+    a small amount of optimality for major speedup. The (1-1/e) guarantee
+    still holds for batch_size=1; for larger batches it degrades gracefully.
 
     # submodular: greedy gives (1-1/e) ≈ 0.632 approximation bound
     # see Nemhauser, Wolsey, Fisher (1978)
@@ -249,11 +254,10 @@ def greedy_allocate_fast(
 
     risk_int = rs.risk_by_threat[interior_idx]  # (N_int, T)
 
-    # Precompute pairwise distances ONCE (the expensive part)
+    # Precompute pairwise distances ONCE
     pairwise_dists = sp_dist.cdist(int_coords, int_coords)  # (N_int, N_int)
 
-    # Build coverage kernels per resource type — only for types we can actually place
-    # (skip types at supply cap or over budget)
+    # Build coverage kernels only for placeable resource types
     kernel_influences: list[NDArray | None] = [None] * K
     terrain_int = park.terrain[interior_idx]
 
@@ -270,7 +274,6 @@ def greedy_allocate_fast(
         else:
             inf = (pairwise_dists <= radius).astype(np.float64)
 
-        # Apply terrain modifiers (row = target cell terrain)
         for ci, tname_t in enumerate(park.terrain_names):
             row_mask = terrain_int == ci
             mod = rt.terrain_modifier.get(tname_t, 1.0)
@@ -279,14 +282,12 @@ def greedy_allocate_fast(
 
         kernel_influences[k] = inf
 
-    # Track total units per type to avoid recomputing each iteration
     type_totals = alloc.units.sum(axis=0).copy()
-
     step = 0
+
     while alloc.budget_used < alloc.budget_limit:
-        best_gain_per_cost = -1e-15
-        best_cell_int = -1
-        best_res = -1
+        # Compute marginal gains for ALL (cell, resource_type) pairs
+        all_gains = np.full((N_int, K), -np.inf, dtype=np.float64)
 
         for k in range(K):
             if kernel_influences[k] is None:
@@ -299,41 +300,68 @@ def greedy_allocate_fast(
             inf_k = kernel_influences[k]
             alpha_k = alpha_matrix[k]
 
-            # Marginal gain for placing one unit of type k at each candidate cell j:
-            # gain(j) = sum_t sum_i risk[i,t] * exp(-exp[i,t]) * (1 - exp(-alpha[k,t]*inf[i,j]))
             gains = np.zeros(N_int, dtype=np.float64)
             for ti in range(T):
                 if alpha_k[ti] < 1e-12:
                     continue
-                miss = np.exp(-current_exponent[:, ti])  # (N_int,)
-                delta_term = 1.0 - np.exp(-alpha_k[ti] * inf_k)  # (N_int, N_int)
-                weighted = risk_int[:, ti] * miss  # (N_int,)
-                gains += weighted @ delta_term  # (N_int,)
+                miss = np.exp(-current_exponent[:, ti])
+                delta_term = 1.0 - np.exp(-alpha_k[ti] * inf_k)
+                weighted = risk_int[:, ti] * miss
+                gains += weighted @ delta_term
 
-            gains /= total_risk * costs[k]
+            all_gains[:, k] = gains / (total_risk * costs[k])
 
-            best_j = np.argmax(gains)
-            if gains[best_j] > best_gain_per_cost:
-                best_gain_per_cost = gains[best_j]
-                best_cell_int = best_j
-                best_res = k
+        # Find global best
+        flat_best = np.argmax(all_gains)
+        best_cell_int, best_res = divmod(int(flat_best), K)
 
-        if best_cell_int < 0 or best_gain_per_cost < 1e-12:
+        if all_gains[best_cell_int, best_res] < 1e-12:
             break
 
-        # Place the unit
-        full_idx = interior_idx[best_cell_int]
-        alloc.units[full_idx, best_res] += 1
-        alloc.budget_used += costs[best_res]
-        type_totals[best_res] += 1
+        # Batch placement: take top-B distinct cells for the best resource type
+        # (placing in the same type avoids cross-type interference issues)
+        remaining_budget = alloc.budget_limit - alloc.budget_used
+        remaining_supply = int(alloc.supply_caps[best_res] - type_totals[best_res])
+        max_placeable = min(
+            batch_size,
+            remaining_supply,
+            int(remaining_budget / costs[best_res]),
+        )
 
-        # Update exponent incrementally
-        inf_placed = kernel_influences[best_res][:, best_cell_int]
-        for ti in range(T):
-            current_exponent[:, ti] += alpha_matrix[best_res, ti] * inf_placed
+        if max_placeable <= 0:
+            break
 
-        step += 1
-        if verbose and step % 50 == 0:
+        k = best_res
+        gains_k = all_gains[:, k].copy()
+        placed_this_batch = 0
+
+        for _ in range(max_placeable):
+            j = int(np.argmax(gains_k))
+            if gains_k[j] < 1e-12:
+                break
+
+            full_idx = interior_idx[j]
+            alloc.units[full_idx, k] += 1
+            alloc.budget_used += costs[k]
+            type_totals[k] += 1
+            placed_this_batch += 1
+
+            # Update exponent from this placement
+            inf_placed = kernel_influences[k][:, j]
+            for ti in range(T):
+                current_exponent[:, ti] += alpha_matrix[k, ti] * inf_placed
+
+            # Suppress this cell and nearby cells from being re-picked in this batch
+            # (avoid stacking too many units in overlapping coverage)
+            gains_k[j] = -np.inf
+            # Also reduce gains of nearby cells (within one radius)
+            radius = alloc.resource_types[k].coverage_radius_km
+            nearby = pairwise_dists[j] < radius
+            gains_k[nearby] *= 0.5  # dampen, don't eliminate
+
+        step += placed_this_batch
+
+        if verbose and step % 50 < placed_this_batch:
             p = 1.0 - np.exp(-current_exponent)
             ppi_val = (risk_int * p).sum() / total_risk
             print(f"  Step {step}: PPI={ppi_val:.4f}, budget={alloc.budget_used:.1f}/{alloc.budget_limit:.1f}")
