@@ -377,13 +377,18 @@ def greedy_allocate_fast(
 def lp_upper_bound(allocation: Allocation) -> float:
     """LP relaxation upper bound on PPI via PuLP/CBC.
 
-    Relaxes integer unit placements to continuous, linearizes the detection
-    probability using its tangent at the current allocation. This provides
-    an upper bound on the achievable PPI, useful as a sanity check on the
-    greedy solution quality.
+    Relaxes the detection model: for each cell i and threat t, define
+    p[i,t] = min(1, sum_k alpha[k,t] * eff[k,i]) as a linear upper
+    bound on the true 1-exp(-...) detection. Because the linear function
+    dominates the concave exponential everywhere, the LP objective is an
+    upper bound on the true PPI.
+
+    We model the coverage kernel explicitly:
+      eff[i,k] = sum_j kernel[i,j] * x[j,k]
+    so that the LP accounts for resource spillover to nearby cells.
 
     Returns:
-        Upper bound on PPI (float). Returns inf if LP is infeasible.
+        Upper bound on PPI (float). Returns inf if solver fails.
     """
     try:
         import pulp
@@ -400,63 +405,89 @@ def lp_upper_bound(allocation: Allocation) -> float:
     if N_int == 0:
         return 0.0
 
-    # Linearize: for small allocations, p ≈ sum_k alpha_kt * eff_k
-    # Upper bound on PPI: maximize sum_i sum_t risk[i,t] * min(1, sum_k alpha*eff)
-    # We use a simpler LP: maximize coverage subject to budget
+    total_risk = rs.risk_by_threat[interior].sum()
+    if total_risk < 1e-12:
+        return 0.0
+
+    # Precompute kernel matrices (same as greedy, but only for interior)
+    int_coords = park.cell_centers[interior]
+    pairwise = sp_dist.cdist(int_coords, int_coords)
+    terrain_int = park.terrain[interior]
+
+    kernel_mats: list[NDArray] = []
+    for k, rt in enumerate(allocation.resource_types):
+        radius = rt.coverage_radius_km
+        if allocation.kernel == "gaussian":
+            km = np.exp(-0.5 * (pairwise / radius) ** 2)
+            km[pairwise > 3 * radius] = 0.0
+        else:
+            km = (pairwise <= radius).astype(np.float64)
+        for ci, tn in enumerate(park.terrain_names):
+            row_mask = terrain_int == ci
+            mod = rt.terrain_modifier.get(tn, 1.0)
+            if abs(mod - 1.0) > 1e-9:
+                km[row_mask, :] *= mod
+        kernel_mats.append(km)
 
     prob = pulp.LpProblem("PPI_upper_bound", pulp.LpMaximize)
 
-    # Decision variables: x[i, k] = continuous units at cell i, type k
+    # Decision variables: x[j, k] = continuous units at interior cell j, type k
     x = {}
-    for idx, ci in enumerate(interior):
+    for j in range(N_int):
         for k in range(K):
-            x[idx, k] = pulp.LpVariable(f"x_{idx}_{k}", lowBound=0)
+            x[j, k] = pulp.LpVariable(f"x_{j}_{k}", lowBound=0)
 
-    # Coverage variable per cell per threat (capped at 1)
-    # p_var[i, t] <= sum_k alpha[k,t] * x[i,k]  (linearization)
-    # p_var[i, t] <= 1
+    # Detection proxy per cell per threat, capped at 1
     p_var = {}
-    for idx in range(N_int):
+    for i in range(N_int):
         for ti in range(T):
-            p_var[idx, ti] = pulp.LpVariable(f"p_{idx}_{ti}", lowBound=0, upBound=1)
+            p_var[i, ti] = pulp.LpVariable(f"p_{i}_{ti}", lowBound=0, upBound=1)
 
-    # Objective: maximize weighted detection
-    total_risk = rs.risk_by_threat[interior].sum()
+    # Objective: maximize sum_i sum_t risk[i,t] * p[i,t] / total_risk
     obj_terms = []
-    for idx in range(N_int):
-        ci = interior[idx]
+    for i in range(N_int):
+        ci = interior[i]
         for ti in range(T):
             coeff = rs.risk_by_threat[ci, ti] / total_risk
             if coeff > 1e-12:
-                obj_terms.append(coeff * p_var[idx, ti])
-
+                obj_terms.append(coeff * p_var[i, ti])
     prob += pulp.lpSum(obj_terms)
 
-    # Detection constraint (linearized)
+    # Detection constraint: p[i,t] <= sum_k alpha[k,t] * eff[i,k]
+    # where eff[i,k] = sum_j kernel_k[i,j] * x[j,k]
     costs = [rt.cost_per_unit for rt in allocation.resource_types]
-    for idx in range(N_int):
+    for i in range(N_int):
         for ti, tname in enumerate(rs.threat_names):
-            alpha_sum = pulp.lpSum([
-                allocation.resource_types[k].detection_alpha.get(tname, 0.0) * x[idx, k]
-                for k in range(K)
-            ])
-            prob += p_var[idx, ti] <= alpha_sum
+            # sum_k alpha[k,t] * sum_j kernel_k[i,j] * x[j,k]
+            terms = []
+            for k in range(K):
+                alpha_kt = allocation.resource_types[k].detection_alpha.get(tname, 0.0)
+                if alpha_kt < 1e-12:
+                    continue
+                km_row = kernel_mats[k][i]  # (N_int,)
+                for j in range(N_int):
+                    if km_row[j] > 1e-6:
+                        terms.append(alpha_kt * km_row[j] * x[j, k])
+            if terms:
+                prob += p_var[i, ti] <= pulp.lpSum(terms)
+            else:
+                prob += p_var[i, ti] <= 0
 
     # Budget constraint
     budget_terms = []
-    for idx in range(N_int):
+    for j in range(N_int):
         for k in range(K):
-            budget_terms.append(costs[k] * x[idx, k])
+            budget_terms.append(costs[k] * x[j, k])
     prob += pulp.lpSum(budget_terms) <= allocation.budget_limit
 
     # Supply caps
     for k in range(K):
         cap = allocation.supply_caps[k]
         if cap < 999999:
-            prob += pulp.lpSum([x[idx, k] for idx in range(N_int)]) <= cap
+            prob += pulp.lpSum([x[j, k] for j in range(N_int)]) <= cap
 
-    # Solve (suppress output)
-    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    # Solve (suppress output, time limit 30s)
+    prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=30))
 
     if prob.status == pulp.constants.LpStatusOptimal:
         return float(pulp.value(prob.objective))
