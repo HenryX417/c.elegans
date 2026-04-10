@@ -1,0 +1,56 @@
+# Wildlife Protection Model — Matplotlib Style
+# Clean, professional style for math contest figures
+
+# Figure
+figure.figsize: 8, 5
+figure.dpi: 150
+figure.facecolor: white
+figure.edgecolor: white
+figure.autolayout: True
+
+# Font
+font.family: serif
+font.size: 11
+font.serif: DejaVu Serif, Times New Roman, Times, serif
+
+# Axes
+axes.facecolor: white
+axes.edgecolor: 333333
+axes.linewidth: 0.8
+axes.grid: True
+axes.titlesize: 13
+axes.titleweight: bold
+axes.labelsize: 11
+axes.labelweight: normal
+axes.prop_cycle: cycler('color', ['2E86AB', 'A23B72', 'F18F01', '4B8F29', 'C73E1D', '3B1F2B', '44BBA4', 'E94F37'])
+
+# Grid
+grid.color: CCCCCC
+grid.linewidth: 0.5
+grid.linestyle: --
+grid.alpha: 0.7
+
+# Ticks
+xtick.direction: out
+ytick.direction: out
+xtick.major.size: 4
+ytick.major.size: 4
+xtick.labelsize: 10
+ytick.labelsize: 10
+
+# Legend
+legend.fontsize: 10
+legend.frameon: True
+legend.framealpha: 0.9
+legend.edgecolor: CCCCCC
+legend.fancybox: True
+
+# Lines
+lines.linewidth: 1.8
+lines.markersize: 6
+
+# Savefig
+savefig.dpi: 300
+savefig.bbox: tight
+savefig.pad_inches: 0.1
+savefig.facecolor: white
