@@ -110,6 +110,8 @@ def _build_feature_matrix(park: Park, season: str = "dry") -> NDArray[np.float64
                 "rainforest": 0.05,
                 "alpine": 0.6,
                 "wetland": 0.5,
+                "shrubland": 0.6,
+                "woodland": 0.35,
             }
             for ci, tname in enumerate(park.terrain_names):
                 mask = park.terrain == ci
@@ -146,9 +148,18 @@ def build_risk_surface(
     S = len(species_names)
     T = len(threat_names)
 
-    species_weights = np.array(
+    raw_species_weights = np.array(
         [species_cfg[s]["weight"] for s in species_names], dtype=np.float64
     )
+    populations = np.array(
+        [species_cfg[s].get("population", 1000) for s in species_names], dtype=np.float64
+    )
+    # Effective weight: w / sqrt(pop) — sqrt to avoid rare species completely
+    # dominating while still biasing protection toward endangered species.
+    species_weights = raw_species_weights / np.sqrt(populations)
+    # Normalize so weights sum to original sum (preserves risk magnitude)
+    species_weights *= raw_species_weights.sum() / (species_weights.sum() + 1e-12)
+
     threat_weights = np.array(
         [threats_cfg[t]["weight"] for t in threat_names], dtype=np.float64
     )
@@ -188,7 +199,7 @@ def build_risk_surface(
             habitat_mod = np.ones(N, dtype=np.float64)
             for ci, tn in enumerate(park.terrain_names):
                 mask = park.terrain == ci
-                habitat_mod[mask] = 0.5 + 0.5 * habitat_pref.get(tn, 0.5)
+                habitat_mod[mask] = 0.1 + 0.9 * habitat_pref.get(tn, 0.1)
 
             # Waterhole affinity: species near waterholes face higher threat near waterholes
             wh_aff = sp.get("waterhole_affinity", 0.5)
@@ -197,6 +208,29 @@ def build_risk_surface(
 
             risk_st[:, si, ti] = (base + wh_boost) * habitat_mod
 
+    # Apply biome_effects: poaching_concealment and wildfire_susceptibility
+    from .resources import get_biome_effects
+    biome_effects = get_biome_effects()
+    if biome_effects:
+        _threat_biome_key = {
+            "poaching": "poaching_concealment",
+            "illegal_logging": "poaching_concealment",
+        }
+        _fire_threats = {"wildfire"}
+        for ti, tname in enumerate(threat_names):
+            bkey = _threat_biome_key.get(tname)
+            is_fire = tname in _fire_threats
+            if bkey or is_fire:
+                for ci, tn in enumerate(park.terrain_names):
+                    be = biome_effects.get(tn, {})
+                    mask = park.terrain == ci
+                    if bkey:
+                        mult = 0.5 + 0.5 * be.get(bkey, 0.5)
+                        risk_st[mask, :, ti] *= mult
+                    if is_fire:
+                        mult = 0.5 + 0.5 * be.get("wildfire_susceptibility", 0.5)
+                        risk_st[mask, :, ti] *= mult
+
     # Shift risk to be non-negative (per species-threat pair)
     for si in range(S):
         for ti in range(T):
@@ -204,6 +238,16 @@ def build_risk_surface(
             col_min = col[park.inside_mask].min() if park.inside_mask.any() else 0.0
             if col_min < 0:
                 risk_st[:, si, ti] -= col_min
+
+    # Seasonal pan risk modifiers
+    if season == "wet":
+        # Wet season: pan fills with water → zero risk on pan cells
+        risk_st[park.pan_mask, :, :] = 0.0
+    else:
+        # Dry season: pan edge cells (within 5 km of pan boundary) get risk boost
+        # Animals concentrate at drying pan edges
+        pan_edge = (~park.pan_mask) & (park.dist_pan_boundary < 5.0) & park.inside_mask
+        risk_st[pan_edge, :, :] *= 1.8
 
     # Zero out exterior cells
     risk_st[~park.inside_mask, :, :] = 0.0

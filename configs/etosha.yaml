@@ -93,13 +93,16 @@ road_segments:
   - [[85, 50], [95, 52]]        # Cross-pan route
   - [[70, 55], [85, 50]]        # Okaukuejo east link
 
-# Terrain classes (fraction of park area)
-terrain_types:
-  grassland: 0.35
-  savanna_woodland: 0.25
-  salt_pan: 0.21     # Etosha Pan
-  mopane_woodland: 0.12
-  dolomite_hills: 0.07
+# Biome polygons — priority-ordered, first containing polygon wins.
+# Cells not matched by any polygon get the default_biome.
+biome_polygons:
+  - name: salt_pan
+    polygon: [[50, 50], [140, 45], [145, 55], [150, 70], [140, 80], [100, 85], [60, 80], [45, 65]]
+  - name: woodland
+    polygon: [[150, 70], [198, 70], [195, 90], [185, 110], [150, 115]]
+  - name: shrubland
+    polygon: [[0, 0], [70, 0], [70, 120], [0, 120]]
+default_biome: grassland
 
 # Staff
 current_rangers: 295
@@ -107,25 +110,23 @@ current_rangers: 295
 # Species of interest (with conservation weights — higher = more protection priority)
 species:
   black_rhino:
-    weight: 1.0          # highest priority — endangered, active poaching
+    weight: 1.5          # highest priority — endangered, active poaching
     population: 70       # estimated remaining
     habitat_preference:   # terrain affinity (0-1)
-      grassland: 0.3
-      savanna_woodland: 0.8
+      grassland: 0.05
+      woodland: 0.95
       salt_pan: 0.0
-      mopane_woodland: 0.6
-      dolomite_hills: 0.4
-    waterhole_affinity: 0.9    # strongly water-dependent
+      shrubland: 0.15
+    waterhole_affinity: 0.95   # strongly water-dependent
     seasonal_shift: 0.3        # moderate shift toward water in dry season
   elephant:
     weight: 0.7
     population: 2500
     habitat_preference:
       grassland: 0.4
-      savanna_woodland: 0.7
+      woodland: 0.75
       salt_pan: 0.1
-      mopane_woodland: 0.8
-      dolomite_hills: 0.2
+      shrubland: 0.2
     waterhole_affinity: 0.95
     seasonal_shift: 0.4
   lion:
@@ -133,22 +134,20 @@ species:
     population: 150
     habitat_preference:
       grassland: 0.7
-      savanna_woodland: 0.6
+      woodland: 0.45
       salt_pan: 0.1
-      mopane_woodland: 0.3
-      dolomite_hills: 0.2
+      shrubland: 0.2
     waterhole_affinity: 0.7
     seasonal_shift: 0.2
   plains_herbivores:
-    weight: 0.3
+    weight: 0.25
     population: 30000    # zebra, springbok, oryx, kudu combined
     habitat_preference:
-      grassland: 0.9
-      savanna_woodland: 0.5
-      salt_pan: 0.2
-      mopane_woodland: 0.3
-      dolomite_hills: 0.1
-    waterhole_affinity: 0.8
+      grassland: 0.85
+      woodland: 0.25
+      salt_pan: 0.15
+      shrubland: 0.05
+    waterhole_affinity: 0.45
     seasonal_shift: 0.5
 
 # Threat types (with weights — higher = more dangerous)

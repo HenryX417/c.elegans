@@ -74,17 +74,19 @@ def ppi_disaggregated(alloc: Allocation) -> dict[str, dict[str, float]]:
         else:
             result["by_threat"][tname] = 0.0
 
-    # By species: PPI_s = sum_i sum_t risk_st[i,s,t] * p[i,t] / sum_i sum_t risk_st[i,s,t]
-    # Explicitly loop over threats to ensure correct threat-specific p indexing
+    # By species: PPI_s = Σ_i Σ_t w_t * risk_st[i,s,t] * p[i,t]
+    #                   / Σ_i Σ_t w_t * risk_st[i,s,t]
+    # Weight by threat_weights so high-priority threats dominate species PPI.
     int_idx = np.where(interior)[0]
     for si, sname in enumerate(rs.species_names):
         num = 0.0
         den = 0.0
         for ti in range(len(rs.threat_names)):
+            tw = float(rs.threat_weights[ti])
             risk_slice = rs.risk_st[int_idx, si, ti]      # (N_int,)
             det_slice = p[int_idx, ti]                     # (N_int,) — threat-specific
-            num += float((risk_slice * det_slice).sum())
-            den += float(risk_slice.sum())
+            num += tw * float((risk_slice * det_slice).sum())
+            den += tw * float(risk_slice.sum())
         result["by_species"][sname] = float(num / den) if den > 1e-12 else 0.0
 
     return result
@@ -130,13 +132,17 @@ def equity_index(alloc: Allocation) -> dict[str, float]:
 def disruption_score(alloc: Allocation) -> float:
     """Total wildlife disruption from deployed resources.
 
-    disruption = Σ_i Σ_k δ[k] · units[k,i] · animal_density[i]
+    disruption = Σ_i Σ_k δ[k] · units[i,k] · exp(-dist_wh[i] / 10)
+
+    Uses waterhole proximity as a proxy for animal presence: resources
+    deployed near waterholes cause more disruption because animals
+    concentrate there.
     """
-    density = alloc.park.animal_density  # (N,)
+    wh_factor = np.exp(-alloc.park.dist_waterhole / 10.0)  # (N,)
     total = 0.0
     for k, rt in enumerate(alloc.resource_types):
         placed = alloc.units[:, k].astype(np.float64)
-        total += rt.disruption_delta * (placed * density).sum()
+        total += rt.disruption_delta * (placed * wh_factor).sum()
     return float(total)
 
 
@@ -146,44 +152,74 @@ def robustness_score(
     n_samples: int = 20,
     seed: int = 42,
 ) -> float:
-    """PPI under adversarial poacher best-response.
+    """PPI under adversarial poacher best-response (Stackelberg model).
 
-    The adversarial poacher picks the highest-risk cell with the lowest
-    detection probability. For randomized patrols, we average over
-    multiple samples of patrol assignments.
+    The adversary chooses the cell maximizing risk * (1 - expected_detection).
+    For deterministic patrols the adversary knows the fixed routes (pool[0]).
+    For randomized patrols the adversary faces the expected detection
+    over random route selections, which is strictly better for the defender
+    (Stackelberg security games).
 
     Returns:
-        "Worst-case" PPI: detection probability at the poacher's chosen cell.
+        Detection probability at the adversary's chosen cell.
     """
+    from .temporal import build_route_pools
+
     rs = alloc.risk_surface
-    interior = alloc.park.inside_mask
+    park = alloc.park
+    interior = park.inside_mask
+    N = len(park.cell_centers)
 
-    p = _get_detection(alloc)
-    p_overall = _cell_p_overall(alloc, p)
+    # Base detection from ALL resources (Gaussian spread = deterrent effect)
+    base_p = _get_detection(alloc)
 
-    # Adversary chooses: highest risk[i] * (1 - p[i]) cell
+    # Build route pools (same builder as temporal.simulate)
+    route_pools = build_route_pools(alloc, route_pool_size=5, seed=seed)
+
     risk = rs.risk.copy()
     risk[~interior] = 0.0
 
-    # Adversary payoff: risk * (1 - detection)
-    adversary_payoff = risk * (1.0 - p_overall)
-    worst_cell = np.argmax(adversary_payoff)
+    # Threat-specific patrol boost (consistent with temporal.simulate)
+    _patrol_boost = {
+        "poaching": 0.8,
+        "unauthorized_entry": 0.8,
+        "human_wildlife_conflict": 0.5,
+        "wildfire": 0.1,
+    }
+    patrol_boost = np.array(
+        [_patrol_boost.get(t, 0.5) for t in rs.threat_names], dtype=np.float64
+    )
+
+    def _compute_p_overall(route_selector) -> NDArray[np.float64]:
+        """Compute overall detection for all cells given route selection."""
+        daily_p = base_p.copy()
+        for pool in route_pools:
+            if pool:
+                route = route_selector(pool)
+                for c in route.cells:
+                    if interior[c]:
+                        daily_p[c, :] = np.clip(daily_p[c, :] + patrol_boost, 0.0, 1.0)
+        return _cell_p_overall(alloc, daily_p)
 
     if not randomized:
-        return float(p_overall[worst_cell])
+        # Deterministic: adversary knows base deployment AND patrol routes (pool[0]).
+        # Adversary picks the cell that maximizes risk*(1-p) with full info.
+        p_det = _compute_p_overall(lambda pool: pool[0])
+        adversary_payoff = risk * (1.0 - p_det)
+        adversary_cell = int(np.argmax(adversary_payoff))
+        return float(p_det[adversary_cell])
 
-    # Randomized: average over patrol permutations
-    # (simplified: we jitter detection by ±20% and average the worst-case)
+    # Randomized: adversary faces expected detection over route realizations.
+    # Adversary picks cell maximizing risk*(1-E[p]); detection = E[p] there.
     rng = np.random.default_rng(seed)
-    worst_cases = []
+    p_samples = []
     for _ in range(n_samples):
-        noise = 1.0 + rng.uniform(-0.2, 0.2, size=p_overall.shape)
-        p_jittered = np.clip(p_overall * noise, 0.0, 1.0)
-        adv = risk * (1.0 - p_jittered)
-        wc = np.argmax(adv)
-        worst_cases.append(p_jittered[wc])
-
-    return float(np.mean(worst_cases))
+        p_s = _compute_p_overall(lambda pool: pool[rng.integers(len(pool))])
+        p_samples.append(p_s)
+    p_expected = np.mean(p_samples, axis=0)
+    adversary_payoff = risk * (1.0 - p_expected)
+    adversary_cell = int(np.argmax(adversary_payoff))
+    return float(p_expected[adversary_cell])
 
 
 def cost_efficiency(alloc: Allocation) -> dict[str, float]:
