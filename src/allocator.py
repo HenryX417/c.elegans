@@ -334,6 +334,10 @@ def greedy_allocate_fast(
         k = best_res
         gains_k = all_gains[:, k].copy()
         placed_this_batch = 0
+        inf_k = kernel_influences[k]
+        alpha_k = alpha_matrix[k]
+        radius_k = alloc.resource_types[k].coverage_radius_km
+        cutoff = 3 * radius_k if alloc.kernel == "gaussian" else radius_k
 
         for _ in range(max_placeable):
             j = int(np.argmax(gains_k))
@@ -347,17 +351,26 @@ def greedy_allocate_fast(
             placed_this_batch += 1
 
             # Update exponent from this placement
-            inf_placed = kernel_influences[k][:, j]
+            inf_placed = inf_k[:, j]
             for ti in range(T):
-                current_exponent[:, ti] += alpha_matrix[k, ti] * inf_placed
+                current_exponent[:, ti] += alpha_k[ti] * inf_placed
 
-            # Suppress this cell and nearby cells from being re-picked in this batch
-            # (avoid stacking too many units in overlapping coverage)
+            # Mark placed cell as unavailable
             gains_k[j] = -np.inf
-            # Also reduce gains of nearby cells (within one radius)
-            radius = alloc.resource_types[k].coverage_radius_km
-            nearby = pairwise_dists[j] < radius
-            gains_k[nearby] *= 0.5  # dampen, don't eliminate
+
+            # Recompute gains for cells whose kernel overlaps the placed cell
+            affected = np.where(pairwise_dists[j] < cutoff)[0]
+            active_aff = affected[gains_k[affected] > -1e10]
+            if len(active_aff) > 0:
+                new_g = np.zeros(len(active_aff), dtype=np.float64)
+                for ti in range(T):
+                    if alpha_k[ti] < 1e-12:
+                        continue
+                    miss = np.exp(-current_exponent[:, ti])
+                    weighted = risk_int[:, ti] * miss  # (N_int,)
+                    delta_cols = 1.0 - np.exp(-alpha_k[ti] * inf_k[:, active_aff])
+                    new_g += weighted @ delta_cols
+                gains_k[active_aff] = new_g / (total_risk * costs[k])
 
         step += placed_this_batch
 

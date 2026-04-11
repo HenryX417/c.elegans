@@ -36,6 +36,7 @@ class Park:
         dist_road: (N,) float — distance to nearest road segment in km.
         dist_waterhole: (N,) float — distance to nearest waterhole in km.
         dist_camp: (N,) float — distance to nearest camp in km.
+        dist_pan_boundary: (N,) float — distance to nearest pan/lake edge in km.
         waterholes: (W, 2) array of waterhole coordinates.
         camps: list of camp dicts from config.
         animal_density: (N,) float — relative animal density per cell.
@@ -55,6 +56,7 @@ class Park:
     dist_road: NDArray[np.float64]
     dist_waterhole: NDArray[np.float64]
     dist_camp: NDArray[np.float64]
+    dist_pan_boundary: NDArray[np.float64]
     waterholes: NDArray[np.float64]
     camps: list[dict[str, Any]]
     animal_density: NDArray[np.float64]
@@ -186,22 +188,51 @@ def _compute_terrain(
     cell_centers: NDArray, inside_mask: NDArray, pan_mask: NDArray,
     config: dict, rng: np.random.Generator
 ) -> tuple[NDArray[np.int32], list[str]]:
-    """Assign terrain class to each cell based on config fractions and spatial rules.
+    """Assign terrain class to each cell.
 
-    Pan cells get salt_pan terrain. Others are assigned probabilistically
-    based on configured fractions, with some spatial coherence via smoothing.
+    If config contains ``biome_polygons``, uses priority-ordered point-in-polygon
+    assignment (first containing polygon wins).  Unmatched cells receive the
+    ``default_biome``.  Falls back to the legacy probabilistic ``terrain_types``
+    method when ``biome_polygons`` is absent.
     """
-    terrain_types = config.get("terrain_types", {})
-    names = list(terrain_types.keys())
-    fracs = np.array([terrain_types[n] for n in names], dtype=np.float64)
+    biome_cfg = config.get("biome_polygons")
 
-    # Normalize fracs excluding pan (pan is assigned directly)
-    pan_idx = names.index("salt_pan") if "salt_pan" in names else -1
+    if biome_cfg is not None:
+        # --- Polygon-based terrain assignment ---
+        default_biome = config.get("default_biome", "grassland")
+        # Collect unique biome names in priority order, default last
+        names: list[str] = []
+        for entry in biome_cfg:
+            bname = entry["name"]
+            if bname not in names:
+                names.append(bname)
+        if default_biome not in names:
+            names.append(default_biome)
+        default_idx = names.index(default_biome)
+
+        terrain = np.full(len(cell_centers), default_idx, dtype=np.int32)
+
+        # Assign in reverse priority so earlier entries overwrite later ones
+        for entry in reversed(biome_cfg):
+            poly = np.array(entry["polygon"], dtype=np.float64)
+            bname = entry["name"]
+            idx = names.index(bname)
+            mask = _point_in_polygon(cell_centers, poly) & inside_mask
+            terrain[mask] = idx
+
+        # Zero out exterior cells (they get index 0 but inside_mask filters them)
+        return terrain, names
+
+    # --- Legacy probabilistic method ---
+    terrain_types = config.get("terrain_types", {})
+    names_legacy = list(terrain_types.keys())
+    fracs = np.array([terrain_types[n] for n in names_legacy], dtype=np.float64)
+
+    pan_idx = names_legacy.index("salt_pan") if "salt_pan" in names_legacy else -1
     terrain = np.zeros(len(cell_centers), dtype=np.int32)
 
     if pan_idx >= 0:
         terrain[pan_mask & inside_mask] = pan_idx
-        # Redistribute pan fraction to others for non-pan cells
         non_pan_fracs = fracs.copy()
         non_pan_fracs[pan_idx] = 0.0
         if non_pan_fracs.sum() > 0:
@@ -209,14 +240,13 @@ def _compute_terrain(
     else:
         non_pan_fracs = fracs / fracs.sum()
 
-    # Assign non-pan interior cells
     non_pan_interior = inside_mask & ~pan_mask
     n_non_pan = non_pan_interior.sum()
     if n_non_pan > 0:
-        assignments = rng.choice(len(names), size=n_non_pan, p=non_pan_fracs)
+        assignments = rng.choice(len(names_legacy), size=n_non_pan, p=non_pan_fracs)
         terrain[non_pan_interior] = assignments
 
-    return terrain, names
+    return terrain, names_legacy
 
 
 def _compute_animal_density(
@@ -311,6 +341,12 @@ def load_park(config_path: str | Path, seed: int = 42) -> Park:
     else:
         dist_camp = np.full(len(cell_centers), 50.0)
 
+    # Distance to pan boundary
+    if len(pan_poly) > 0:
+        dist_pan_boundary = _dist_to_polygon_boundary(cell_centers, pan_poly)
+    else:
+        dist_pan_boundary = np.full(len(cell_centers), 999.0)
+
     # Terrain
     terrain, terrain_names = _compute_terrain(cell_centers, inside_mask, pan_mask, config, rng)
 
@@ -332,6 +368,7 @@ def load_park(config_path: str | Path, seed: int = 42) -> Park:
         dist_road=dist_road,
         dist_waterhole=dist_waterhole,
         dist_camp=dist_camp,
+        dist_pan_boundary=dist_pan_boundary,
         waterholes=waterholes,
         camps=camp_list,
         animal_density=animal_density,

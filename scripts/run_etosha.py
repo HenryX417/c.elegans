@@ -28,6 +28,7 @@ from src.scores import ppi, ppi_disaggregated, coverage_fraction, equity_index, 
 from src.temporal import simulate
 from src.plotting import (
     plot_risk_surface, plot_allocation, plot_ppi_disaggregated, plot_temporal,
+    plot_disruption_map, plot_freshness_decay,
 )
 
 SEED = 42
@@ -86,6 +87,19 @@ def main() -> None:
     print(f"  Robustness (rnd): {rob_rand:.3f}")
     print(f"  Response time:    {resp:.2f} hrs")
 
+    # Species priority verification table
+    print(f"\n--- SPECIES PRIORITY TABLE ---")
+    print(f"{'Species':<20} {'Weight':>8} {'Pop':>8} {'Eff.Wt':>8} {'PPI':>8} {'RiskMass':>10}")
+    print("-" * 68)
+    for si, sname in enumerate(rs.species_names):
+        sp_cfg = park.config["species"][sname]
+        weight = sp_cfg["weight"]
+        pop = sp_cfg.get("population", 1000)
+        eff_wt = float(rs.species_weights[si])
+        sp_ppi = disagg["by_species"].get(sname, 0.0)
+        risk_mass = float(rs.risk_by_species[park.inside_mask, si].sum())
+        print(f"{sname:<20} {weight:>8.2f} {pop:>8d} {eff_wt:>8.4f} {sp_ppi:>8.4f} {risk_mass:>10.2f}")
+
     # LP upper bound
     print("\nComputing LP upper bound...")
     ub = lp_upper_bound(alloc)
@@ -113,6 +127,15 @@ def main() -> None:
     intercepted_ts = np.array([d.threats_intercepted for d in sim.days])
     plot_temporal(sim.ppi_timeseries, intercepted_ts, name="fig_temporal_30day", park_name="Etosha")
     print("  -> fig_temporal_30day.png")
+
+    # Disruption map
+    plot_disruption_map(alloc, name="fig_disruption_map", park_name="Etosha")
+    print("  -> fig_disruption_map.png")
+
+    # Freshness decay
+    plot_freshness_decay(sim.freshness_timeseries, sim.ppi_timeseries,
+                         name="fig_freshness_decay", park_name="Etosha")
+    print("  -> fig_freshness_decay.png")
 
     # 7. Save tables
     tables_dir = ROOT / "outputs" / "tables"

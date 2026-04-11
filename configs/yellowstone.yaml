@@ -70,12 +70,15 @@ road_segments:
   - [[30, 85], [25, 35]]
   - [[60, 40], [95, 45]]
 
-terrain_types:
-  alpine: 0.20
-  forest: 0.45         # dense lodgepole pine
-  grassland: 0.15      # valleys, meadows
-  wetland: 0.10        # geothermal areas, river margins
-  dolomite_hills: 0.10 # rocky outcrops
+# Biome polygons — priority-ordered, first containing polygon wins.
+biome_polygons:
+  - name: wetland
+    polygon: [[45, 20], [75, 17], [80, 35], [75, 50], [50, 53], [40, 45]]
+  - name: grassland
+    polygon: [[50, 60], [75, 60], [75, 85], [50, 85]]
+  - name: alpine
+    polygon: [[70, 5], [95, 5], [95, 30], [70, 30]]
+default_biome: forest
 
 current_rangers: 200
 
@@ -88,7 +91,6 @@ species:
       forest: 0.8
       grassland: 0.4
       wetland: 0.3
-      dolomite_hills: 0.5
     waterhole_affinity: 0.6
     seasonal_shift: 0.2
   wolf:
@@ -99,7 +101,6 @@ species:
       forest: 0.6
       grassland: 0.8
       wetland: 0.2
-      dolomite_hills: 0.3
     waterhole_affinity: 0.4
     seasonal_shift: 0.1
   elk:
@@ -110,7 +111,6 @@ species:
       forest: 0.5
       grassland: 0.9
       wetland: 0.3
-      dolomite_hills: 0.2
     waterhole_affinity: 0.7
     seasonal_shift: 0.4
   bison:
@@ -121,7 +121,6 @@ species:
       forest: 0.3
       grassland: 0.9
       wetland: 0.4
-      dolomite_hills: 0.1
     waterhole_affinity: 0.5
     seasonal_shift: 0.3
 
@@ -188,4 +187,3 @@ resource_overrides:
       forest: 0.3       # dense canopy limits drones
       grassland: 1.0
       wetland: 0.8
-      dolomite_hills: 0.8

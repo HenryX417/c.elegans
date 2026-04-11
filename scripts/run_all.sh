@@ -59,6 +59,8 @@ EXPECTED_FIGURES=(
     "fig_sierra_risk_surface"
     "fig_sierra_allocation"
     "fig_adaptation_comparison"
+    "fig_disruption_map"
+    "fig_freshness_decay"
 )
 
 EXPECTED_TABLES=(

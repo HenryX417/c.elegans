@@ -18,6 +18,14 @@ from scipy.spatial import distance as sp_dist
 from .park import Park
 from .risk import RiskSurface
 
+# Module-level biome effects, populated by load_resource_types().
+_biome_effects: dict[str, dict[str, float]] = {}
+
+
+def get_biome_effects() -> dict[str, dict[str, float]]:
+    """Return the currently loaded biome effects dict."""
+    return _biome_effects
+
 
 @dataclass
 class ResourceType:
@@ -107,10 +115,14 @@ def load_resource_types(
     Returns:
         Tuple of (list of ResourceType, kernel_type string).
     """
+    global _biome_effects
+
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
     kernel = cfg.get("coverage_kernel", "gaussian")
+    _biome_effects = cfg.get("biome_effects", {})
+
     park_overrides = {}
     if park_config and "resource_overrides" in park_config:
         park_overrides = park_config["resource_overrides"]
@@ -188,6 +200,19 @@ def compute_effective_units(
             mask = park.terrain == ci
             mod = rt.terrain_modifier.get(tname, 1.0)
             effective[mask, k] *= mod
+
+        # Apply biome_effects (patrol_speed_mult for mobile, drone_visibility for aerial)
+        if _biome_effects:
+            is_mobile = rt.name in ("ranger_foot_team", "vehicle_patrol")
+            is_aerial = rt.name in ("drone", "aerial_overflight")
+            if is_mobile or is_aerial:
+                effect_key = "patrol_speed_mult" if is_mobile else "drone_visibility"
+                for ci, tname in enumerate(park.terrain_names):
+                    be = _biome_effects.get(tname, {})
+                    mult = be.get(effect_key, 1.0)
+                    if abs(mult - 1.0) > 1e-6:
+                        mask = park.terrain == ci
+                        effective[mask, k] *= mult
 
     return effective
 

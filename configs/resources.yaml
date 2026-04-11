@@ -13,6 +13,8 @@ resource_types:
     disruption_delta: 0.15       # mild disruption to wildlife
     terrain_modifier:
       grassland: 1.0
+      shrubland: 0.85
+      woodland: 0.7
       savanna_woodland: 0.8
       salt_pan: 0.7              # hard to walk on
       mopane_woodland: 0.6
@@ -36,6 +38,8 @@ resource_types:
     disruption_delta: 0.35
     terrain_modifier:
       grassland: 1.0
+      shrubland: 0.9
+      woodland: 0.7
       savanna_woodland: 0.9
       salt_pan: 0.5
       mopane_woodland: 0.7
@@ -60,6 +64,8 @@ resource_types:
     disruption_delta: 0.02
     terrain_modifier:
       grassland: 1.0
+      shrubland: 0.85
+      woodland: 0.6
       savanna_woodland: 0.7
       salt_pan: 1.0
       mopane_woodland: 0.5
@@ -81,6 +87,8 @@ resource_types:
     disruption_delta: 0.10
     terrain_modifier:
       grassland: 1.0
+      shrubland: 0.85
+      woodland: 0.55
       savanna_woodland: 0.8
       salt_pan: 1.0
       mopane_woodland: 0.6
@@ -103,6 +111,8 @@ resource_types:
     disruption_delta: 0.01
     terrain_modifier:
       grassland: 0.8
+      shrubland: 0.9
+      woodland: 0.95
       savanna_woodland: 1.0
       salt_pan: 0.5
       mopane_woodland: 0.9
@@ -124,6 +134,8 @@ resource_types:
     disruption_delta: 0.25
     terrain_modifier:
       grassland: 1.0
+      shrubland: 0.85
+      woodland: 0.55
       savanna_woodland: 0.7
       salt_pan: 1.0
       mopane_woodland: 0.5
@@ -146,6 +158,8 @@ resource_types:
     disruption_delta: 0.01
     terrain_modifier:
       grassland: 1.0
+      shrubland: 1.0
+      woodland: 1.0
       savanna_woodland: 1.0
       salt_pan: 1.0
       mopane_woodland: 1.0
@@ -170,6 +184,8 @@ resource_types:
     disruption_delta: 0.01       # passive, no disruption
     terrain_modifier:
       grassland: 0.7
+      shrubland: 0.75
+      woodland: 0.85
       savanna_woodland: 0.8
       salt_pan: 0.5              # little sound propagation over open pan
       mopane_woodland: 0.9
@@ -191,6 +207,8 @@ resource_types:
     disruption_delta: 0.02       # passive, minimal disruption
     terrain_modifier:
       grassland: 1.0
+      shrubland: 0.9
+      woodland: 0.65
       savanna_woodland: 0.8
       salt_pan: 1.0              # excellent thermal contrast
       mopane_woodland: 0.6
@@ -212,6 +230,8 @@ resource_types:
     disruption_delta: 0.01       # passive, no disruption
     terrain_modifier:
       grassland: 0.8
+      shrubland: 0.9
+      woodland: 0.95
       savanna_woodland: 1.0
       salt_pan: 0.5
       mopane_woodland: 0.9
@@ -225,3 +245,51 @@ resource_types:
 coverage_kernel: gaussian       # options: gaussian, tophat
 # For gaussian: influence(d) = exp(-0.5 * (d / radius)^2)
 # For tophat: influence(d) = 1.0 if d <= radius else 0.0
+
+# Biome-level effects applied to resource effectiveness and risk
+biome_effects:
+  grassland:
+    patrol_speed_mult: 1.0
+    drone_visibility: 1.0
+    poaching_concealment: 0.2
+    wildfire_susceptibility: 0.7
+  shrubland:
+    patrol_speed_mult: 0.85
+    drone_visibility: 0.8
+    poaching_concealment: 0.4
+    wildfire_susceptibility: 0.5
+  woodland:
+    patrol_speed_mult: 0.7
+    drone_visibility: 0.5
+    poaching_concealment: 0.7
+    wildfire_susceptibility: 0.4
+  salt_pan:
+    patrol_speed_mult: 0.6
+    drone_visibility: 1.0
+    poaching_concealment: 0.05
+    wildfire_susceptibility: 0.0
+  forest:
+    patrol_speed_mult: 0.5
+    drone_visibility: 0.3
+    poaching_concealment: 0.8
+    wildfire_susceptibility: 0.6
+  rainforest:
+    patrol_speed_mult: 0.35
+    drone_visibility: 0.15
+    poaching_concealment: 0.9
+    wildfire_susceptibility: 0.2
+  alpine:
+    patrol_speed_mult: 0.6
+    drone_visibility: 0.9
+    poaching_concealment: 0.3
+    wildfire_susceptibility: 0.3
+  wetland:
+    patrol_speed_mult: 0.4
+    drone_visibility: 0.7
+    poaching_concealment: 0.5
+    wildfire_susceptibility: 0.1
+  dolomite_hills:
+    patrol_speed_mult: 0.55
+    drone_visibility: 0.8
+    poaching_concealment: 0.5
+    wildfire_susceptibility: 0.3

@@ -404,3 +404,76 @@ def plot_adaptation_comparison(
 
     fig.tight_layout()
     _save(fig, name)
+
+
+DISRUPTION_CMAP = LinearSegmentedColormap.from_list(
+    "disruption", ["#FFFFFF", "#D4E6F1", "#F5B041", "#E74C3C", "#7B241C"], N=256
+)
+
+
+def plot_disruption_map(
+    alloc: Allocation,
+    name: str = "fig_disruption_map",
+    park_name: str | None = None,
+) -> None:
+    """Heatmap of per-cell disruption score overlaid on park geometry."""
+    park = alloc.park
+    pname = park_name or park.name
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Per-cell disruption: sum_k delta * units[i,k] * exp(-dist_wh[i]/10)
+    wh_factor = np.exp(-park.dist_waterhole / 10.0)
+    cell_disruption = np.zeros(len(park.cell_centers))
+    for k, rt in enumerate(alloc.resource_types):
+        placed = alloc.units[:, k].astype(np.float64)
+        cell_disruption += rt.disruption_delta * placed * wh_factor
+
+    grid = _grid_to_2d(park, cell_disruption)
+    bounds = park.config["bounds"]
+    extent = [bounds["x_min_km"], bounds["x_max_km"], bounds["y_min_km"], bounds["y_max_km"]]
+
+    im = ax.imshow(grid, origin="lower", extent=extent, cmap=DISRUPTION_CMAP, aspect="equal")
+    fig.colorbar(im, ax=ax, shrink=0.8, label="Disruption Score")
+
+    _draw_park_features(ax, park)
+    ax.set_title(f"{pname} — Wildlife Disruption Map")
+    ax.legend(loc="upper right", fontsize=8)
+
+    fig.tight_layout()
+    _save(fig, name)
+
+
+def plot_freshness_decay(
+    freshness_ts: NDArray,
+    ppi_ts: NDArray | None = None,
+    name: str = "fig_freshness_decay",
+    park_name: str = "Etosha",
+) -> None:
+    """Mean freshness score over time, optionally with PPI overlay."""
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    days = np.arange(1, len(freshness_ts) + 1)
+
+    ax1.plot(days, freshness_ts, "o-", color="#44BBA4", linewidth=2, markersize=4,
+             label="Mean Freshness")
+    ax1.axhline(freshness_ts.mean(), color="#2E86AB", linestyle="--", alpha=0.6,
+                label=f"Avg Freshness = {freshness_ts.mean():.3f}")
+    ax1.set_xlabel("Day")
+    ax1.set_ylabel("Mean Freshness Score")
+    ax1.set_ylim(0, 1.05)
+
+    if ppi_ts is not None:
+        ax2 = ax1.twinx()
+        ax2.plot(days, ppi_ts, "s--", color="#A23B72", linewidth=1.5, markersize=3,
+                 alpha=0.7, label="Daily PPI")
+        ax2.set_ylabel("PPI", color="#A23B72")
+        ax2.tick_params(axis="y", labelcolor="#A23B72")
+        ax2.set_ylim(0, 1.05)
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right")
+    else:
+        ax1.legend(loc="lower right")
+
+    ax1.set_title(f"{park_name} — Patrol Freshness Decay (τ = 7 days)")
+    fig.tight_layout()
+    _save(fig, name)
